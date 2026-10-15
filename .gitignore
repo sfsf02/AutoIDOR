@@ -151,6 +151,10 @@ activemq-data/
 
 # Environments
 .env
+.env.*
+!.env.example
+auth_state.json
+errors.log
 .envrc
 .venv
 env/
