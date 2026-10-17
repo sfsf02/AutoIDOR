@@ -20,8 +20,9 @@ except ImportError:  # Environment variables can still be supplied by the shell.
     pass
 
 logger = logging.getLogger(__name__)
-STATE_PATH = Path("auth_state.json")
-ERRORS_PATH = Path("errors.log")
+ROOT = Path(__file__).resolve().parents[2]
+STATE_PATH = ROOT / "auth_state.json"
+ERRORS_PATH = ROOT / "errors.log"
 
 
 def _log_failure(message: str, exc: Exception) -> None:
