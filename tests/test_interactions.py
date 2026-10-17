@@ -1,6 +1,8 @@
 """Focused checks for Person B's authentication and interaction hooks."""
 
 import json
+import logging
+from urllib.parse import quote
 
 import pytest
 from playwright.async_api import async_playwright
@@ -105,4 +107,66 @@ async def test_clicked_never_exceeds_max_clickables():
         assert clicks == 5
         assert await page.evaluate("document.querySelectorAll('[data-idor-tag]').length") == 0
         await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_restore_state_warns_when_origin_does_not_match(caplog, monkeypatch, tmp_path):
+    state_path = tmp_path / "auth_state.json"
+    state_path.write_text(
+        json.dumps({
+            "cookies": [],
+            "origins": [{
+                "origin": "https://app.internal",
+                "localStorage": [{"name": "token", "value": "x"}],
+            }],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(auth, "STATE_PATH", state_path)
+
+    async def fulfill(route):
+        await route.fulfill(status=200, content_type="text/html", body="<html></html>")
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.route("**/www.app.internal/**", fulfill)
+        await page.goto("https://www.app.internal/")
+        with caplog.at_level(logging.WARNING, logger="src.discovery.auth"):
+            await auth.login_if_needed(page)
+        await browser.close()
+
+    warnings = [r.getMessage() for r in caplog.records if "Skipping localStorage restore" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_login_failure_banner_skips_state_and_logs(monkeypatch, tmp_path):
+    login_html = (
+        "<html><body>"
+        "<form id='login'>"
+        "<input type='email' name='username' autocomplete='username'>"
+        "<input type='password' name='password' autocomplete='current-password'>"
+        "<button type='submit'>Log in</button>"
+        "</form>"
+        "<div role='alert'>Invalid credentials</div>"
+        "<script>document.getElementById('login')"
+        ".addEventListener('submit', e => e.preventDefault());</script>"
+        "</body></html>"
+    )
+    monkeypatch.setattr(auth, "STATE_PATH", tmp_path / "auth_state.json")
+    monkeypatch.setattr(auth, "ERRORS_PATH", tmp_path / "errors.log")
+    monkeypatch.setenv("LOGIN_URL", "data:text/html;charset=utf-8," + quote(login_html))
+    monkeypatch.setenv("LOGIN_USERNAME", "demo")
+    monkeypatch.setenv("LOGIN_PASSWORD", "wrong")
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await auth.login_if_needed(page)
+        await browser.close()
+
+    assert not (tmp_path / "auth_state.json").exists()
+    errors = (tmp_path / "errors.log").read_text(encoding="utf-8")
+    assert "Login failed" in errors
 

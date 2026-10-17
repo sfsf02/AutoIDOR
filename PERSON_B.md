@@ -56,16 +56,25 @@ async def trigger_page_interactions(page: Page) -> None
   `pytest` behaves identically when invoked from the repo root or from `tests/`.
   This is test-only infrastructure; no module code is affected.
 
-Follow-ups B-4 (warn on localStorage origin mismatch) and B-5 (surface silent
-login failure) are tracked separately on `fix/discovery-followups`.
+### Follow-ups (`fix/discovery-followups`)
+
+- **B-4 — warn on localStorage origin mismatch.** `_restore_state` logs a
+  warning when a saved origin's netloc does not match the current page origin,
+  so a silent localStorage drop (e.g. login on `app.internal`, SPA on
+  `www.app.internal`) becomes visible instead of failing silently.
+- **B-5 — surface silent login failure.** After the submit click and load-state
+  wait, `login_if_needed` inspects `[role=alert], .error, .alert-danger`. If an
+  error banner is present it raises `RuntimeError("Login failed — page shows: …")`
+  inside the existing `try/except`, so `_log_failure` records it in `errors.log`
+  and `auth_state.json` is **not** written for an unauthenticated session.
 
 ## Files touched
 
 | File | Change |
 | --- | --- |
-| `src/discovery/auth.py` | B-1: anchored `STATE_PATH`/`ERRORS_PATH` to repo root |
+| `src/discovery/auth.py` | B-1: anchored state paths; B-4: origin-mismatch warning; B-5: login-failure detection |
 | `src/discovery/interactions.py` | B-3: tag-then-click selection, DOM cleanup |
-| `tests/test_interactions.py` | B-1/B-3 regression tests; fixed state leak in existing test |
+| `tests/test_interactions.py` | B-1/B-3/B-4/B-5 regression tests; fixed state leak in existing test |
 | `tests/conftest.py` | Repo root importable regardless of CWD |
 | `PERSON_B.md` | This document |
 
@@ -84,7 +93,7 @@ python -m pytest tests -v
 cd tests && python -m pytest . -v
 ```
 
-Both invocations run the same 6 Person B tests:
+Both invocations run the same 8 Person B tests:
 
 - `test_missing_credentials_is_noop`
 - `test_existing_state_restores_cookies`
@@ -92,6 +101,8 @@ Both invocations run the same 6 Person B tests:
 - `test_state_paths_are_anchored_to_repo_root` (B-1)
 - `test_clicks_lazy_show_more_exactly_once_and_cleans_tags` (B-3)
 - `test_clicked_never_exceeds_max_clickables` (B-3)
+- `test_restore_state_warns_when_origin_does_not_match` (B-4)
+- `test_login_failure_banner_skips_state_and_logs` (B-5)
 
 ### B-1: verify state location is CWD-independent
 
@@ -118,6 +129,20 @@ git status                            # no auth_state.json listed
 The unit tests above cover a lazy "Show more" button (clicked exactly once,
 tags cleaned up) and the five-click ceiling. The scrolling/skip rules are
 unchanged from the base implementation.
+
+### B-4: verify origin-mismatch warning
+
+`test_restore_state_warns_when_origin_does_not_match` saves an origin for
+`https://app.internal`, loads a page at `https://www.app.internal/`, and asserts
+exactly one `Skipping localStorage restore for origin …` warning is logged with
+no exception.
+
+### B-5: verify silent login failure is surfaced
+
+`test_login_failure_banner_skips_state_and_logs` runs `login_if_needed` against
+a page containing `<div role="alert">Invalid credentials</div>` and asserts that
+`errors.log` contains a `Login failed` line and that `auth_state.json` was not
+written.
 
 ### Manual login smoke check
 
