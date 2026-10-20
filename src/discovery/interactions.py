@@ -8,7 +8,7 @@ from playwright.async_api import Page
 
 logger = logging.getLogger(__name__)
 MAX_CLICKABLES = 5
-ACTION_TIMEOUT_MS = 350
+ACTION_TIMEOUT_MS = 2000
 
 async def trigger_page_interactions(page: Page) -> None:
     """Scroll and activate up to five clearly safe expansion controls; never raise."""
@@ -49,7 +49,8 @@ async def trigger_page_interactions(page: Page) -> None:
             try:
                 await candidates.nth(i).click(timeout=ACTION_TIMEOUT_MS)
                 clicked += 1
-            except Exception:
+            except Exception as exc:
+                logger.debug("Safe interaction %d was not clicked: %s", i, exc)
                 continue
         logger.info("Page interactions complete (clicked %d safe controls)", clicked)
     except Exception as exc:
@@ -62,4 +63,3 @@ async def trigger_page_interactions(page: Page) -> None:
             )
         except Exception:
             pass
-
