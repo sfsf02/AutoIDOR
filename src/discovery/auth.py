@@ -20,8 +20,9 @@ except ImportError:  # Environment variables can still be supplied by the shell.
     pass
 
 logger = logging.getLogger(__name__)
-STATE_PATH = Path("auth_state.json")
-ERRORS_PATH = Path("errors.log")
+ROOT = Path(__file__).resolve().parents[2]
+STATE_PATH = ROOT / "auth_state.json"
+ERRORS_PATH = ROOT / "errors.log"
 
 
 def _log_failure(message: str, exc: Exception) -> None:
@@ -45,7 +46,14 @@ async def _restore_state(page: Page, state: dict[str, Any]) -> None:
     current_origin = urlparse(page.url).netloc
     for origin in origins:
         origin_url = urlparse(origin.get("origin", ""))
-        if origin_url.netloc != current_origin or not origin_url.scheme:
+        if not origin_url.scheme or not origin_url.netloc:
+            continue
+        if origin_url.netloc != current_origin:
+            logger.warning(
+                "Skipping localStorage restore for origin %s (page origin is %s)",
+                origin_url.netloc,
+                current_origin,
+            )
             continue
         values = origin.get("localStorage", [])
         await page.evaluate(
@@ -84,6 +92,12 @@ async def login_if_needed(page: Page) -> None:
         ).first
         await submit.click(timeout=5000)
         await page.wait_for_load_state("domcontentloaded", timeout=5000)
+
+        error_banner = page.locator("[role=alert], .error, .alert-danger").first
+        if await error_banner.count() > 0:
+            text = (await error_banner.inner_text()).strip()
+            raise RuntimeError(f"Login failed — page shows: {text!r}")
+
         await page.context.storage_state(path=str(STATE_PATH))
         logger.info("Login completed; saved session to %s", STATE_PATH)
     except Exception as exc:

@@ -16,31 +16,50 @@ async def trigger_page_interactions(page: Page) -> None:
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await page.wait_for_timeout(100)
 
-        controls = page.locator("button, [role=button], a")
-        safe_indices = await page.evaluate(
+        await page.evaluate(
             """() => {
-              const safe = ['load more', 'show more', 'see more', 'view more', 'expand', 'read more'];
-              const unsafe = ['delete', 'remove', 'cancel', 'unsubscribe', 'purchase', 'buy',
-                'checkout', 'pay', 'submit', 'save', 'confirm', 'send', 'logout', 'log out'];
-              return [...document.querySelectorAll('button, [role=button], a')].slice(0, 500)
-                .map((el, index) => ({el, index, text: (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase()}))
-                .filter(({el, text}) => text && !el.matches(':disabled,[aria-disabled=true]') &&
-                  !el.closest('form') && !unsafe.some(word => text.includes(word)) &&
-                  safe.some(word => text.includes(word)))
-                .map(({index}) => index);
+              const safe = ['load more', 'show more', 'see more', 'view more',
+                            'expand', 'read more'];
+              const unsafe = ['delete', 'remove', 'cancel', 'unsubscribe',
+                'purchase', 'buy', 'checkout', 'pay', 'submit', 'save',
+                'confirm', 'send', 'logout', 'log out'];
+              document.querySelectorAll('[data-idor-tag]')
+                .forEach(el => el.removeAttribute('data-idor-tag'));
+              [...document.querySelectorAll('button, [role=button], a')]
+                .slice(0, 500)
+                .forEach((el) => {
+                  const text = (el.innerText
+                    || el.getAttribute('aria-label') || '')
+                    .trim().toLowerCase();
+                  if (!text) return;
+                  if (el.matches(':disabled,[aria-disabled=true]')) return;
+                  if (el.closest('form')) return;
+                  if (unsafe.some(word => text.includes(word))) return;
+                  if (!safe.some(word => text.includes(word))) return;
+                  el.setAttribute('data-idor-tag', 'candidate');
+                });
+              return document.querySelectorAll('[data-idor-tag]').length;
             }"""
         )
+
         clicked = 0
-        for index in safe_indices:
-            if clicked >= MAX_CLICKABLES:
-                break
-            control = controls.nth(index)
+        candidates = page.locator("[data-idor-tag]")
+        count = await candidates.count()
+        for i in range(min(count, MAX_CLICKABLES)):
             try:
-                await control.click(timeout=ACTION_TIMEOUT_MS)
+                await candidates.nth(i).click(timeout=ACTION_TIMEOUT_MS)
                 clicked += 1
             except Exception:
                 continue
         logger.info("Page interactions complete (clicked %d safe controls)", clicked)
     except Exception as exc:
         logger.debug("Page interaction skipped after browser error: %s", exc)
+    finally:
+        try:
+            await page.evaluate(
+                "() => document.querySelectorAll('[data-idor-tag]')"
+                ".forEach(el => el.removeAttribute('data-idor-tag'))"
+            )
+        except Exception:
+            pass
 
