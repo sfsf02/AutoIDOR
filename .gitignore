@@ -151,6 +151,13 @@ activemq-data/
 
 # Environments
 .env
+.env.*
+!.env.example
+auth_state.json
+auth_states/
+captures/*
+!captures/.gitkeep
+errors.log
 .envrc
 .venv
 env/
@@ -218,3 +225,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+captures/
+*.mitm
+errors.log
