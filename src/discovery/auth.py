@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -25,10 +24,10 @@ STATE_PATH = ROOT / "auth_state.json"
 ERRORS_PATH = ROOT / "errors.log"
 
 
-def _log_failure(message: str, exc: Exception) -> None:
+def _log_failure(message: str, exc: Exception, errors_path: Path = ERRORS_PATH) -> None:
     logger.warning("%s: %s", message, exc)
     try:
-        with ERRORS_PATH.open("a", encoding="utf-8") as errors:
+        with errors_path.open("a", encoding="utf-8") as errors:
             errors.write(f"{message}: {exc}\n")
     except OSError:
         logger.exception("Could not write authentication failure to errors.log")
@@ -41,20 +40,27 @@ async def _restore_state(page: Page, state: dict[str, Any]) -> None:
         await context.add_cookies(cookies)
 
     # Playwright's storage_state is normally supplied when creating a context.
-    # Person B receives an already-created Page, so restore local storage in-place.
+    # Person B receives an already-created Page, so navigate it to each origin
+    # before restoring local storage.
     origins = state.get("origins", [])
-    current_origin = urlparse(page.url).netloc
+    current_origin = urlparse(page.url)
     for origin in origins:
-        origin_url = urlparse(origin.get("origin", ""))
+        origin_value = origin.get("origin", "")
+        origin_url = urlparse(origin_value)
         if not origin_url.scheme or not origin_url.netloc:
             continue
-        if origin_url.netloc != current_origin:
+        if current_origin.scheme and (
+            origin_url.scheme != current_origin.scheme
+            or origin_url.netloc != current_origin.netloc
+        ):
             logger.warning(
                 "Skipping localStorage restore for origin %s (page origin is %s)",
-                origin_url.netloc,
-                current_origin,
+                origin_url.geturl(),
+                current_origin.geturl(),
             )
             continue
+        if not current_origin.scheme or not current_origin.netloc:
+            await page.goto(origin_value, wait_until="domcontentloaded", timeout=15000)
         values = origin.get("localStorage", [])
         await page.evaluate(
             "items => { for (const item of items) localStorage.setItem(item.name, item.value); }",
@@ -62,13 +68,19 @@ async def _restore_state(page: Page, state: dict[str, Any]) -> None:
         )
 
 
-async def login_if_needed(page: Page) -> None:
+async def login_if_needed(
+    page: Page,
+    state_path: Path | None = None,
+    errors_path: Path | None = None,
+) -> None:
     """Restore a saved session or sign in with configured credentials; never raise."""
+    state_file = state_path or STATE_PATH
+    errors_file = errors_path or ERRORS_PATH
     try:
-        if STATE_PATH.is_file():
-            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        if state_file.is_file():
+            state = json.loads(state_file.read_text(encoding="utf-8"))
             await _restore_state(page, state)
-            logger.info("Restored authentication state from %s", STATE_PATH)
+            logger.info("Restored authentication state from %s", state_file)
             return
 
         login_url = os.getenv("LOGIN_URL")
@@ -98,8 +110,8 @@ async def login_if_needed(page: Page) -> None:
             text = (await error_banner.inner_text()).strip()
             raise RuntimeError(f"Login failed — page shows: {text!r}")
 
-        await page.context.storage_state(path=str(STATE_PATH))
-        logger.info("Login completed; saved session to %s", STATE_PATH)
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        await page.context.storage_state(path=str(state_file))
+        logger.info("Login completed; saved session to %s", state_file)
     except Exception as exc:
-        _log_failure("Authentication setup failed", exc)
-
+        _log_failure("Authentication setup failed", exc, errors_file)
