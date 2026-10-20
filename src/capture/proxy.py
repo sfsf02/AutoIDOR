@@ -5,13 +5,66 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
+
+from dotenv import load_dotenv
+
+from src.capture.logger import finalize_spool
 
 
 ROOT = Path(__file__).resolve().parents[2]
 ADDON = ROOT / "src" / "capture" / "logger.py"
 CAPTURE_DIR = ROOT / "captures"
-ERROR_FILE = ROOT / "errors.log"
+
+
+def _report_proxy_error(message: str, error_file: Path | None = None) -> None:
+    """Persist a proxy error when possible and always report it on stderr."""
+    if error_file is not None:
+        try:
+            error_file.parent.mkdir(parents=True, exist_ok=True)
+            with error_file.open("a", encoding="utf-8") as file:
+                file.write(message + "\n")
+            return
+        except OSError as exc:
+            message = f"{message} (could not write {error_file}: {exc})"
+
+    print(message, file=sys.stderr, flush=True)
+
+
+def _scope_url(scope: str) -> str:
+    """Return a parseable URL for a domain, authority, or IPv6 scope."""
+    scope = scope.strip()
+    if "://" in scope:
+        return scope
+    if scope.count(":") > 1 and not scope.startswith("["):
+        scope = f"[{scope}]"
+    return f"http://{scope}"
+
+
+def get_capture_origin_dir(scope: str) -> Path:
+    """Return the persistent capture directory for a target origin/scope."""
+    parsed = urlparse(_scope_url(scope))
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("scope must contain a valid host and port") from exc
+    hostname = (hostname or "").replace(":", "-").rstrip(".").lower()
+    if not hostname:
+        raise ValueError("scope must contain a valid host")
+
+    origin_name = f"{parsed.scheme.lower()}_{hostname}"
+    if port:
+        origin_name = f"{origin_name}_{port}"
+    return CAPTURE_DIR / origin_name
+
+
+def get_proxy_run_dir(scope: str, run_at: datetime | None = None) -> Path:
+    """Return a unique capture directory for one standalone proxy run."""
+    timestamp = (run_at or datetime.now()).strftime("%Y%m%d_%H%M%S_%f")
+    return get_capture_origin_dir(scope) / timestamp
 
 
 async def _wait_until_ready(
@@ -91,6 +144,7 @@ async def start_proxy(
 
     raw_capture = capture_dir / "raw_flows.mitm"
     api_capture = capture_dir / "api_flows.json"
+    error_capture = capture_dir / "proxy_errors.log"
 
     command = [
         sys.executable,
@@ -108,14 +162,14 @@ async def start_proxy(
         str(port),
         "-s",
         str(ADDON),
-        "--set",
-        f"capture_out={api_capture}",
         "--save-stream-file",
         str(raw_capture),
     ]
 
     env = os.environ.copy()
     env["SCOPE_DOMAIN"] = scope
+    env["CAPTURE_OUT"] = str(api_capture)
+    env["CAPTURE_ERROR_OUT"] = str(error_capture)
 
     creationflags = 0
 
@@ -153,10 +207,18 @@ async def start_proxy(
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
+        try:
+            finalize_spool(api_capture)
+        except OSError as exc:
+            _report_proxy_error(
+                f"Could not finalize proxy capture {api_capture}: {exc}",
+                error_capture,
+            )
 
 
 async def _run_cli() -> int:
     """Run the capture proxy until interrupted."""
+    load_dotenv(ROOT / ".env")
     scope = os.getenv("SCOPE_DOMAIN", "").strip()
 
     if not scope:
@@ -165,6 +227,9 @@ async def _run_cli() -> int:
             "test domain first."
         )
         return 1
+
+    capture_dir = get_proxy_run_dir(scope)
+    error_file = capture_dir / "proxy_errors.log"
 
     try:
         port = int(
@@ -181,12 +246,12 @@ async def _run_cli() -> int:
     try:
         async with start_proxy(
             scope=scope,
-            capture_dir=CAPTURE_DIR,
+            capture_dir=capture_dir,
             port=port,
         ):
             print(
                 f"Capture proxy running on "
-                f"127.0.0.1:{port}"
+                f"127.0.0.1:{port}; output: {capture_dir}"
             )
 
             await asyncio.Event().wait()
@@ -195,18 +260,10 @@ async def _run_cli() -> int:
         print("Proxy stopped.")
 
     except Exception as exc:
-        try:
-            with ERROR_FILE.open(
-                "a",
-                encoding="utf-8",
-            ) as file:
-                file.write(
-                    f"Proxy startup/runtime error: {exc}\n"
-                )
-
-        except OSError:
-            pass
-
+        _report_proxy_error(
+            f"Proxy startup/runtime error: {exc}",
+            error_file,
+        )
         print(f"Proxy error: {exc}")
         return 1
 
