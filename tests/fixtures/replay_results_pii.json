@@ -1,0 +1,45 @@
+{
+  "preflight": {
+    "sessions_distinct": true,
+    "probe_url": "/me"
+  },
+  "results": [
+    {
+      "candidate_id": "77777777-7777-7777-7777-777777777777",
+      "request": {
+        "url": "https://our-app.internal/users/1",
+        "method": "GET",
+        "params_hash": "hash-g",
+        "headers_fingerprint": "fp-g"
+      },
+      "session_a": {
+        "label": "owner",
+        "status": 200,
+        "response_size": 1200,
+        "content_type": "application/json",
+        "body_sha256": "sha-a-7",
+        "body_snippet": "{\"id\": 1, \"name\": \"Alice Example\", \"email\": \"alice@example.com\", \"phone\": \"5551234567\"}"
+      },
+      "session_b": {
+        "label": "attacker",
+        "status": 200,
+        "response_size": 1300,
+        "content_type": "application/json",
+        "body_sha256": "sha-b-7",
+        "body_snippet": "{\"id\": 1, \"name\": \"Alice Example\", \"email\": \"alice@example.com\", \"phone\": \"5551234567\", \"notes\": \"private\"}"
+      },
+      "delta": {
+        "status_changed": false,
+        "size_delta_bytes": 100,
+        "content_type_changed": false,
+        "body_identical": false,
+        "session_b_got_owner_object": true,
+        "session_b_denied": false,
+        "redirected_to_login": false
+      },
+      "flags": ["possible_idor"],
+      "replay_error": null,
+      "test_kind": "credential_swap"
+    }
+  ]
+}
