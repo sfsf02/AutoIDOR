@@ -1,0 +1,193 @@
+{
+  "preflight": {
+    "sessions_distinct": true,
+    "probe_url": "/me"
+  },
+  "results": [
+    {
+      "candidate_id": "11111111-1111-1111-1111-111111111111",
+      "request": {
+        "url": "https://our-app.internal/users/1",
+        "method": "GET",
+        "params_hash": "hash-a",
+        "headers_fingerprint": "fp-a"
+      },
+      "session_a": {
+        "label": "owner",
+        "status": 200,
+        "response_size": 1834,
+        "content_type": "application/json",
+        "body_sha256": "sha-a-1",
+        "body_snippet": "{\"id\": 1, \"name\": \"Alice\", \"secret\": \"alice-secret\"}"
+      },
+      "session_b": {
+        "label": "attacker",
+        "status": 200,
+        "response_size": 1920,
+        "content_type": "application/json",
+        "body_sha256": "sha-b-1",
+        "body_snippet": "{\"id\": 1, \"name\": \"Alice\", \"secret\": \"alice-secret-leaked\"}"
+      },
+      "delta": {
+        "status_changed": false,
+        "size_delta_bytes": 86,
+        "content_type_changed": false,
+        "body_identical": false,
+        "session_b_got_owner_object": true,
+        "session_b_denied": false,
+        "redirected_to_login": false
+      },
+      "flags": ["possible_idor"],
+      "replay_error": null,
+      "test_kind": "credential_swap"
+    },
+    {
+      "candidate_id": "22222222-2222-2222-2222-222222222222",
+      "request": {
+        "url": "https://our-app.internal/documents/9",
+        "method": "GET",
+        "params_hash": "hash-b",
+        "headers_fingerprint": "fp-b"
+      },
+      "session_a": {
+        "label": "owner",
+        "status": 200,
+        "response_size": 3000,
+        "content_type": "text/html",
+        "body_sha256": "sha-a-2",
+        "body_snippet": "<html><body>Owner document contents here</body></html>"
+      },
+      "session_b": {
+        "label": "attacker",
+        "status": 200,
+        "response_size": 3040,
+        "content_type": "text/html",
+        "body_sha256": "sha-b-2",
+        "body_snippet": "<html><body>Owner document contents here but slightly different</body></html>"
+      },
+      "delta": {
+        "status_changed": false,
+        "size_delta_bytes": 40,
+        "content_type_changed": false,
+        "body_identical": false,
+        "session_b_got_owner_object": true,
+        "session_b_denied": false,
+        "redirected_to_login": false
+      },
+      "flags": ["possible_idor"],
+      "replay_error": null,
+      "test_kind": "credential_swap"
+    },
+    {
+      "candidate_id": "33333333-3333-3333-3333-333333333333",
+      "request": {
+        "url": "https://our-app.internal/admin/users/1",
+        "method": "GET",
+        "params_hash": "hash-c",
+        "headers_fingerprint": "fp-c"
+      },
+      "session_a": {
+        "label": "owner",
+        "status": 200,
+        "response_size": 500,
+        "content_type": "application/json",
+        "body_sha256": "sha-a-3",
+        "body_snippet": "{\"id\": 1}"
+      },
+      "session_b": {
+        "label": "attacker",
+        "status": 403,
+        "response_size": 120,
+        "content_type": "application/json",
+        "body_sha256": "sha-b-3",
+        "body_snippet": "{\"error\": \"forbidden\"}"
+      },
+      "delta": {
+        "status_changed": true,
+        "size_delta_bytes": -380,
+        "content_type_changed": false,
+        "body_identical": false,
+        "session_b_got_owner_object": false,
+        "session_b_denied": true,
+        "redirected_to_login": false
+      },
+      "flags": ["authorization_enforced"],
+      "replay_error": null,
+      "test_kind": "credential_swap"
+    },
+    {
+      "candidate_id": "44444444-4444-4444-4444-444444444444",
+      "request": {
+        "url": "https://our-app.internal/public/info?id=1",
+        "method": "GET",
+        "params_hash": "hash-d",
+        "headers_fingerprint": "fp-d"
+      },
+      "session_a": {
+        "label": "owner",
+        "status": 200,
+        "response_size": 800,
+        "content_type": "text/html",
+        "body_sha256": "sha-same",
+        "body_snippet": "<html><body>Public info page</body></html>"
+      },
+      "session_b": {
+        "label": "attacker",
+        "status": 200,
+        "response_size": 800,
+        "content_type": "text/html",
+        "body_sha256": "sha-same",
+        "body_snippet": "<html><body>Public info page</body></html>"
+      },
+      "delta": {
+        "status_changed": false,
+        "size_delta_bytes": 0,
+        "content_type_changed": false,
+        "body_identical": true,
+        "session_b_got_owner_object": false,
+        "session_b_denied": false,
+        "redirected_to_login": false
+      },
+      "flags": ["body_identical_across_users"],
+      "replay_error": null,
+      "test_kind": "credential_swap"
+    },
+    {
+      "candidate_id": "55555555-5555-5555-5555-555555555555",
+      "request": {
+        "url": "https://our-app.internal/account/settings",
+        "method": "GET",
+        "params_hash": "hash-e",
+        "headers_fingerprint": "fp-e"
+      },
+      "session_a": {
+        "label": "owner",
+        "status": 302,
+        "response_size": 0,
+        "content_type": "text/html",
+        "body_sha256": "sha-a-5",
+        "body_snippet": ""
+      },
+      "session_b": {
+        "label": "attacker",
+        "status": 302,
+        "response_size": 0,
+        "content_type": "text/html",
+        "body_sha256": "sha-b-5",
+        "body_snippet": ""
+      },
+      "delta": {
+        "status_changed": false,
+        "size_delta_bytes": 0,
+        "content_type_changed": false,
+        "body_identical": false,
+        "session_b_got_owner_object": false,
+        "session_b_denied": false,
+        "redirected_to_login": true
+      },
+      "flags": ["auth_redirect"],
+      "replay_error": null,
+      "test_kind": "credential_swap"
+    }
+  ]
+}

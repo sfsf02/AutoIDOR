@@ -1,0 +1,46 @@
+{
+  "preflight": {
+    "sessions_distinct": false,
+    "probe_url": "/me",
+    "note": "auth_state_attacker.json resolved to the same account as auth_state.json"
+  },
+  "results": [
+    {
+      "candidate_id": "66666666-6666-6666-6666-666666666666",
+      "request": {
+        "url": "https://our-app.internal/users/1",
+        "method": "GET",
+        "params_hash": "hash-f",
+        "headers_fingerprint": "fp-f"
+      },
+      "session_a": {
+        "label": "owner",
+        "status": 200,
+        "response_size": 1000,
+        "content_type": "application/json",
+        "body_sha256": "sha-a-6",
+        "body_snippet": "{\"id\": 1}"
+      },
+      "session_b": {
+        "label": "attacker",
+        "status": 200,
+        "response_size": 1000,
+        "content_type": "application/json",
+        "body_sha256": "sha-a-6",
+        "body_snippet": "{\"id\": 1}"
+      },
+      "delta": {
+        "status_changed": false,
+        "size_delta_bytes": 0,
+        "content_type_changed": false,
+        "body_identical": true,
+        "session_b_got_owner_object": false,
+        "session_b_denied": false,
+        "redirected_to_login": false
+      },
+      "flags": [],
+      "replay_error": null,
+      "test_kind": "credential_swap"
+    }
+  ]
+}

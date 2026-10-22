@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "phase2_results.json",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["candidate_id", "classification", "confidence", "rule_fired", "test_kind", "evidence"],
+    "properties": {
+      "candidate_id": { "type": "string" },
+      "classification": {
+        "type": "string",
+        "enum": ["POSSIBLE_IDOR", "NOT_VULNERABLE", "INCONCLUSIVE"]
+      },
+      "confidence": {
+        "type": ["string", "null"],
+        "enum": ["high", "medium", "low", null]
+      },
+      "rule_fired": {
+        "type": "string",
+        "enum": [
+          "attacker_got_owner_object",
+          "attacker_denied",
+          "body_identical_across_users",
+          "identifier_ignored",
+          "redirect_to_login",
+          "baseline_drift",
+          "no_control",
+          "owner_unreachable",
+          "unexpected_content_type",
+          "small_response",
+          "replay_error",
+          "unknown"
+        ]
+      },
+      "test_kind": {
+        "type": "string",
+        "enum": ["credential_swap", "identifier_mutation"]
+      },
+      "evidence": { "type": "object" }
+    },
+    "additionalProperties": false
+  }
+}
