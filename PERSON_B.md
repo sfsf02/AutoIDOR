@@ -1,17 +1,38 @@
-# Person B: authentication and page interactions
+# Person B: Phase 2 — Credential-Swap Replayer (Stage B)
 
-## What changed
+## Overview
 
-- `src/discovery/auth.py` implements `login_if_needed(page)`: it restores a saved Playwright storage state when present, otherwise signs in using `LOGIN_URL`, `LOGIN_USERNAME`, and `LOGIN_PASSWORD`, then saves `auth_state.json`. Failures are caught and appended to `errors.log`.
-- `src/discovery/interactions.py` implements `trigger_page_interactions(page)`: it scrolls to the bottom and clicks at most five clearly labeled safe expansion controls. It skips form controls and labels associated with destructive or consequential actions. Both hooks log actions and contain browser errors.
-- `tests/test_interactions.py` covers the no-credentials path, saved cookies, and safe control handling.
+Person B (Daniel) owns Stage B of Phase 2 IDOR testing: **`src/testing/replayer.py`**.
+Takes candidate endpoints discovered in Stage A (`captures/run-*/candidates.json`), verifies the baseline response with Session A ("owner"), then replays the identical request using Session B ("attacker") credentials to detect Broken Object Level Authorization / IDOR vulnerabilities.
 
-## How to test
+The output `captures/run-*/replay_results.json` strictly adheres to the Phase 2 contract and feeds directly into Stage C (`classifier.py` and `report.py`).
 
-1. Install dependencies: `python -m pip install -r requirements.txt`.
-2. Install the Playwright browser once: `python -m playwright install chromium`.
-3. Run the focused checks: `python -m pytest tests/test_interactions.py`.
-4. For a manual login check, set `LOGIN_URL`, `LOGIN_USERNAME`, and `LOGIN_PASSWORD` in the environment, then call `await login_if_needed(page)` from an async Playwright session. The generated `auth_state.json` contains session credentials; keep it private.
-5. For an interaction smoke check, navigate the same page to a site you own and call `await trigger_page_interactions(page)`.
+## What Changed in Phase 2
 
-The login selectors target common username/email and password fields and common sign-in buttons. Sites with custom authentication widgets may need selector adjustments.
+- **`src/testing/replayer.py`**:
+  - `replay_all_candidates`: Core async orchestration loop.
+  - `run_stage_b(run_dir)`: Standard pipeline entry point. Reads `<run_dir>/candidates.json`, performs credential swap, and atomically writes `<run_dir>/replay_results.json`.
+  - **Preflight distinctness verification**: Performs a `/me` who-am-i probe using both sessions. If bodies match, aborts immediately with `SameAccountError("attacker_and_owner_are_same_account")` to avoid false negatives.
+  - **Enforces all blocking safety guards**:
+    - Aborts before any HTTP call if either `auth_state.json` or `auth_state_attacker.json` is missing (`MissingAuthStateError`).
+    - GET/HEAD only: enforces `WRITE_METHODS_BLOCKLIST = {"POST", "PUT", "PATCH", "DELETE"}` to protect against unauthorized state changes.
+    - Destructive path protection: skips any URL matching `DESTRUCTIVE_PATH_PATTERNS` (`/delete`, `/remove`, `/logout`, `/signout`, `/purchase`, `/checkout`, `/pay`, `/transfer`, `/upload`, `/password`).
+    - Scope enforcement: fails closed if `SCOPE_DOMAIN` is empty; ensures both URLs reside in `SCOPE_DOMAIN`.
+    - In-code request identity assertions: asserts request method, url, query, and body are byte-identical between sessions (only auth headers differ).
+    - Rate limiting & budget caps: 1 req/sec globally, 1 req/2sec on list endpoints; exponential backoff on 429 (2s, 4s, 8s); hard cap `MAX_REQUESTS_PER_CANDIDATE = 4`.
+    - Secret scrubbing and snippet truncation: trims body snippets to 512 bytes (or 128 bytes for HTML); scrubs JWTs, cookies, CSRF tokens, session keys, and email addresses. Never writes unredacted secrets to disk.
+    - Secondary signal: supports optional integer identifier mutation probes on Session A when configured (`test_kind="identifier_mutation"`).
+- **`tests/mock_server.py`**:
+  - Standalone threaded HTTP mock server implementing the Phase 2 specification routes (`/me`, `/users/1`, `/users/2`, `/public/info`, `/admin/users/1`) for automated and harness testing.
+- **`tests/test_replayer.py`**:
+  - 19 automated tests covering all 8 blocking safety guards, behavior cases (baseline drift, small response, denied, identical body, possible IDOR), and the end-to-end acceptance criteria against the mock server.
+
+## Phase 1 Changes (Reference)
+
+- `src/discovery/auth.py`: `login_if_needed(page)` restores saved session or signs in.
+- `src/discovery/interactions.py`: `trigger_page_interactions(page)` scrolls and clicks safe expanders.
+- `tests/test_interactions.py`: covers interaction and auth restoration.
+
+## How to Test
+
+See [`TESTING_PERSON_B.md`](file:///C:/Users/user/Desktop/Daniel/Projects/AutoIDOR/TESTING_PERSON_B.md) for the complete clean-run testing guide and acceptance evidence.
