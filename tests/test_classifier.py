@@ -1,3 +1,4 @@
+
 import json
 import os
 import sys
@@ -89,7 +90,7 @@ def test_redirect_to_login_is_inconclusive():
     assert result["rule_fired"] == "redirect_to_login"
 
 
-def test_baseline_drift_is_not_vulnerable():
+def test_baseline_drift_is_inconclusive():
     record = {
         "candidate_id": "x",
         "session_a": {"status": 200, "content_type": "application/json", "response_size": 1000},
@@ -102,7 +103,7 @@ def test_baseline_drift_is_not_vulnerable():
         "flags": [], "replay_error": "baseline_drift", "test_kind": "credential_swap",
     }
     result = classifier.classify_record(record)
-    assert result["classification"] == "NOT_VULNERABLE"
+    assert result["classification"] == "INCONCLUSIVE"
     assert result["rule_fired"] == "baseline_drift"
 
 
@@ -190,6 +191,86 @@ def test_identifier_mutation_alone_cannot_produce_possible_idor():
 
 
 # ---------------------------------------------------------------------------
+# Regression tests for Stage C review fixes
+# ---------------------------------------------------------------------------
+
+def test_status_changed_without_owner_object_is_inconclusive():
+    record = {
+        "candidate_id": "status-change-test",
+        "request": {
+            "url": "https://example.test/users/1",
+            "method": "GET",
+        },
+        "session_a": {
+            "status": 200,
+            "response_size": 200,
+            "content_type": "application/json",
+            "body_snippet": '{"id": 1}',
+        },
+        "session_b": {
+            "status": 500,
+            "response_size": 200,
+            "content_type": "application/json",
+            "body_snippet": '{"error": "server error"}',
+        },
+        "delta": {
+            "status_changed": True,
+            "size_delta_bytes": 0,
+            "body_identical": False,
+            "session_b_got_owner_object": False,
+            "session_b_denied": False,
+            "redirected_to_login": False,
+        },
+        "flags": [],
+        "replay_error": None,
+        "test_kind": "credential_swap",
+    }
+
+    result = classifier.classify_record(record)
+
+    assert result["classification"] == "INCONCLUSIVE"
+    assert result["rule_fired"] == "identifier_ignored"
+
+
+def test_missing_content_type_is_inconclusive():
+    record = {
+        "candidate_id": "missing-content-type-test",
+        "request": {
+            "url": "https://example.test/users/1",
+            "method": "GET",
+        },
+        "session_a": {
+            "status": 200,
+            "response_size": 200,
+            "content_type": None,
+            "body_snippet": '{"id": 1}',
+        },
+        "session_b": {
+            "status": 200,
+            "response_size": 200,
+            "content_type": "application/json",
+            "body_snippet": '{"id": 2}',
+        },
+        "delta": {
+            "status_changed": False,
+            "size_delta_bytes": 0,
+            "body_identical": False,
+            "session_b_got_owner_object": False,
+            "session_b_denied": False,
+            "redirected_to_login": False,
+        },
+        "flags": [],
+        "replay_error": None,
+        "test_kind": "credential_swap",
+    }
+
+    result = classifier.classify_record(record)
+
+    assert result["classification"] == "INCONCLUSIVE"
+    assert result["rule_fired"] == "unexpected_content_type"
+
+
+# ---------------------------------------------------------------------------
 # Confidence
 # ---------------------------------------------------------------------------
 
@@ -219,6 +300,22 @@ def test_confidence_low_when_snippets_equal():
     b = {"status": 200, "content_type": "application/json", "body_snippet": "same"}
     delta = {"size_delta_bytes": 500}
     assert classifier.assign_confidence(a, b, delta) == "low"
+
+
+def test_invalid_confidence_is_rejected():
+    results = [
+        {
+            "candidate_id": "bad-confidence-test",
+            "classification": "POSSIBLE_IDOR",
+            "confidence": "VERY_HIGH",
+            "rule_fired": "attacker_got_owner_object",
+            "test_kind": "credential_swap",
+            "evidence": {},
+        }
+    ]
+
+    with pytest.raises(ValueError, match="Invalid confidence"):
+        report._sorted_findings(results)
 
 
 # ---------------------------------------------------------------------------
@@ -374,3 +471,97 @@ def test_classify_record_missing_session_raises_named_error():
     record = {"candidate_id": "abc-123", "session_b": {}, "delta": {}}
     with pytest.raises(classifier.StageCInputError, match="abc-123"):
         classifier.classify_record(record)
+
+def test_status_changed_without_owner_object_is_inconclusive():
+    record = {
+        "candidate_id": "status-change-test",
+        "request": {
+            "url": "https://example.test/users/1",
+            "method": "GET",
+        },
+        "session_a": {
+            "status": 200,
+            "response_size": 200,
+            "content_type": "application/json",
+            "body_snippet": '{"id": 1}',
+        },
+        "session_b": {
+            "status": 500,
+            "response_size": 200,
+            "content_type": "application/json",
+            "body_snippet": '{"error": "server error"}',
+        },
+        "delta": {
+            "status_changed": True,
+            "size_delta_bytes": 0,
+            "body_identical": False,
+            "session_b_got_owner_object": False,
+            "session_b_denied": False,
+            "redirected_to_login": False,
+        },
+        "flags": [],
+        "replay_error": None,
+        "test_kind": "credential_swap",
+    }
+
+    result = classifier.classify_record(record)
+
+    assert result["classification"] == "INCONCLUSIVE"
+    assert result["rule_fired"] == "identifier_ignored"
+
+
+def test_missing_content_type_is_inconclusive():
+    record = {
+        "candidate_id": "missing-content-type-test",
+        "request": {
+            "url": "https://example.test/users/1",
+            "method": "GET",
+        },
+        "session_a": {
+            "status": 200,
+            "response_size": 200,
+            "content_type": None,
+            "body_snippet": '{"id": 1}',
+        },
+        "session_b": {
+            "status": 200,
+            "response_size": 200,
+            "content_type": "application/json",
+            "body_snippet": '{"id": 2}',
+        },
+        "delta": {
+            "status_changed": False,
+            "size_delta_bytes": 0,
+            "body_identical": False,
+            "session_b_got_owner_object": False,
+            "session_b_denied": False,
+            "redirected_to_login": False,
+        },
+        "flags": [],
+        "replay_error": None,
+        "test_kind": "credential_swap",
+    }
+
+    result = classifier.classify_record(record)
+
+    assert result["classification"] == "INCONCLUSIVE"
+    assert result["rule_fired"] == "unexpected_content_type"
+
+
+def test_invalid_confidence_is_rejected():
+    results = [
+        {
+            "candidate_id": "bad-confidence-test",
+            "classification": "POSSIBLE_IDOR",
+            "confidence": "VERY_HIGH",
+            "rule_fired": "attacker_got_owner_object",
+            "test_kind": "credential_swap",
+            "evidence": {},
+        }
+    ]
+
+    import pytest
+    from src.testing import report
+
+    with pytest.raises(ValueError, match="Invalid confidence"):
+        report._sorted_findings(results)

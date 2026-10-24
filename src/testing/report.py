@@ -23,8 +23,18 @@ from datetime import datetime, timezone
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _LONG_DIGITS_RE = re.compile(r"\d{7,}")
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")
-_COOKIE_RE = re.compile(r"(?i)(session|sessionid|auth_token|authorization)=[^;\s\"']+")
+_COOKIE_RE = re.compile(r"(?i)(session|sessionid|auth_token|authorization|token|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token)=[^;\s\"']+")
 _NAME_RE = re.compile(r"\b[A-Z][a-z]+ [A-Z][a-z]+\b")
+_URL_QUERY_SECRET_RE = re.compile(
+    r"(?i)((?:session|sessionid|auth|auth_token|authorization|token|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|password|pass|email)=)([^&\s]+)"
+)
+
+
+def redact_url(url: str) -> str:
+    if not url:
+        return url
+    redacted = _URL_QUERY_SECRET_RE.sub(r"\1***", url)
+    return redacted
 
 
 def redact_pii(text: str, cross_reference: str | None = None) -> str:
@@ -40,7 +50,8 @@ def redact_pii(text: str, cross_reference: str | None = None) -> str:
     redacted = text
     redacted = _JWT_RE.sub("***", redacted)
     redacted = _COOKIE_RE.sub(lambda m: m.group(0).split("=")[0] + "=***", redacted)
-    redacted = _EMAIL_RE.sub("@***", redacted)
+    # Redact full email (local part + domain)
+    redacted = _EMAIL_RE.sub("***", redacted)
     redacted = _LONG_DIGITS_RE.sub("***", redacted)
 
     if cross_reference:
@@ -55,7 +66,16 @@ def contains_secret(text: str) -> bool:
     """Used by the grep-style 'no secrets in output' test."""
     if not text:
         return False
-    return bool(_JWT_RE.search(text) or _COOKIE_RE.search(text) or "csrf" in text.lower())
+    if _JWT_RE.search(text) or _COOKIE_RE.search(text):
+        return True
+    if _EMAIL_RE.search(text):
+        return True
+    if re.search(r"(?i)csrf", text):
+        return True
+    # Check for query params with secrets
+    if _URL_QUERY_SECRET_RE.search(text):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -70,16 +90,38 @@ def _timestamp() -> str:
 
 
 def _sorted_findings(results: list[dict]) -> list[dict]:
-    confidence_order = {"high": 0, "medium": 1, "low": 2, None: 3}
+    confidence_order = {"high": 0, "medium": 1, "low": 2}
     findings = [r for r in results if r["classification"] == "POSSIBLE_IDOR"]
+
+    for finding in findings:
+        confidence = finding.get("confidence")
+        if confidence not in confidence_order:
+            raise ValueError(
+                f"Invalid confidence {confidence!r} for "
+                f"candidate_id={finding.get('candidate_id')}"
+            )
+
     return sorted(
         findings,
-        key=lambda r: (confidence_order.get(r.get("confidence"), 3), r["candidate_id"]),
+        key=lambda r: (
+            confidence_order[r["confidence"]],
+            r["candidate_id"],
+        ),
     )
 
 
 def _sorted_by_id(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=lambda r: r["candidate_id"])
+
+
+def _escape_md(text: str) -> str:
+    if text is None:
+        return ""
+    # Escape backticks and pipes to avoid breaking markdown tables
+    text = str(text)
+    text = text.replace("`", "\\`")
+    text = text.replace("|", "\\|")
+    return text
 
 
 def generate_report(results: list[dict], preflight: dict) -> str:
@@ -115,11 +157,11 @@ def generate_report(results: list[dict], preflight: dict) -> str:
     )
     lines.append(f"- NOT_VULNERABLE: {len(not_vulnerable)}")
     lines.append(f"- INCONCLUSIVE: {len(inconclusive)}")
-    sessions_distinct = preflight.get("sessions_distinct", False)
+    sessions_distinct = preflight.get("sessions_distinct", False) if isinstance(preflight, dict) else False
     lines.append(f"- Preflight sessions distinct: {'yes' if sessions_distinct else 'no'}")
     lines.append("")
 
-    lines.append("## ⚠️ High-confidence findings")
+    lines.append("## Findings (POSSIBLE_IDOR)")
     lines.append("")
     lines.append(
         "| candidate_id | method | URL | owner status | attacker status | "
@@ -129,25 +171,47 @@ def generate_report(results: list[dict], preflight: dict) -> str:
     for r in findings_sorted:
         ev = r["evidence"]
         req = ev.get("request") or {}
-        url = req.get("url", "")
-        method = req.get("method", "")
+        url_raw = req.get("url", "") or ""
+        url_redacted = redact_url(url_raw)
+        url = _escape_md(url_redacted)
+        method = _escape_md(req.get("method", ""))
         a_status = ev.get("session_a_status")
         b_status = ev.get("session_b_status")
         size_delta = (ev.get("delta") or {}).get("size_delta_bytes")
+        candidate_id = _escape_md(r['candidate_id'])
+        classification = _escape_md(r['classification'])
+        confidence = _escape_md(r.get('confidence', ''))
+        rule_fired = _escape_md(r['rule_fired'])
         lines.append(
-            f"| {r['candidate_id']} | {method} | {url} | {a_status} | {b_status} | "
-            f"{size_delta} | {r['classification']} | {r.get('confidence', '')} | "
-            f"{r['rule_fired']} |"
+            f"| {candidate_id} | {method} | {url} | {a_status} | {b_status} | "
+            f"{size_delta} | {classification} | {confidence} | "
+            f"{rule_fired} |"
         )
     lines.append("")
 
     if identifier_mutation_rows:
         lines.append("## Corroborating evidence (identifier_mutation records)")
         lines.append("")
-        lines.append("| candidate_id | rule_fired | classification |")
-        lines.append("|---|---|---|")
+        lines.append("| candidate_id | rule_fired | classification | mutated URL | owner status | mutated status | response size (mutated) | content type | redirect | body comparison |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
         for r in identifier_mutation_rows:
-            lines.append(f"| {r['candidate_id']} | {r['rule_fired']} | {r['classification']} |")
+            ev = r["evidence"]
+            req = ev.get("request") or {}
+            url_raw = req.get("url", "") or ""
+            url_redacted = redact_url(url_raw)
+            url = _escape_md(url_redacted)
+            a_status = ev.get("session_a_status")
+            b_status = ev.get("session_b_status")
+            delta = ev.get("delta") or {}
+            size_delta = delta.get("size_delta_bytes")
+            b_ct = ev.get("session_b_content_type") or ev.get("session_a_content_type")
+            redirected = delta.get("redirected_to_login", False)
+            body_identical = delta.get("body_identical", False)
+            body_comp = "identical" if body_identical else "different"
+            lines.append(
+                f"| {_escape_md(r['candidate_id'])} | {_escape_md(r['rule_fired'])} | {_escape_md(r['classification'])} | "
+                f"{url} | {a_status} | {b_status} | {size_delta} | {_escape_md(b_ct or '')} | {redirected} | {body_comp} |"
+            )
         lines.append("")
 
     lines.append("## Inconclusive")
@@ -156,7 +220,8 @@ def generate_report(results: list[dict], preflight: dict) -> str:
     lines.append("|---|---|---|")
     for r in inconclusive:
         err = r["evidence"].get("replay_error")
-        lines.append(f"| {r['candidate_id']} | {r['rule_fired']} | {err} |")
+        err_str = "" if err is None else _escape_md(str(err))
+        lines.append(f"| {_escape_md(r['candidate_id'])} | {_escape_md(r['rule_fired'])} | {err_str} |")
     lines.append("")
 
     lines.append("## Not vulnerable")
@@ -164,7 +229,7 @@ def generate_report(results: list[dict], preflight: dict) -> str:
     lines.append("| candidate_id | rule_fired |")
     lines.append("|---|---|")
     for r in not_vulnerable:
-        lines.append(f"| {r['candidate_id']} | {r['rule_fired']} |")
+        lines.append(f"| {_escape_md(r['candidate_id'])} | {_escape_md(r['rule_fired'])} |")
     lines.append("")
 
     if manual_review:
@@ -179,8 +244,9 @@ def generate_report(results: list[dict], preflight: dict) -> str:
         lines.append("| candidate_id | URL |")
         lines.append("|---|---|")
         for r in manual_review:
-            url = (r["evidence"].get("request") or {}).get("url", "")
-            lines.append(f"| {r['candidate_id']} | {url} |")
+            url_raw = (r["evidence"].get("request") or {}).get("url", "") or ""
+            url = _escape_md(redact_url(url_raw))
+            lines.append(f"| {_escape_md(r['candidate_id'])} | {url} |")
         lines.append("")
 
     lines.append("## Evidence appendix (per POSSIBLE_IDOR finding)")
@@ -195,24 +261,34 @@ def generate_report(results: list[dict], preflight: dict) -> str:
 
         if a_snip != a_snip_raw or b_snip != b_snip_raw:
             pii_redacted_any = True
+        if contains_secret(a_snip_raw) or contains_secret(b_snip_raw):
+            pii_redacted_any = True
 
-        lines.append(f"<details><summary>{r['candidate_id']} ({r.get('confidence')})</summary>")
+        lines.append(f"<details><summary>{_escape_md(r['candidate_id'])} ({_escape_md(str(r.get('confidence')) if r.get('confidence') is not None else '')})</summary>")
         lines.append("")
-        lines.append(f"- Rule fired: `{r['rule_fired']}`")
-        lines.append(f"- Owner (session_a) snippet: `{a_snip}`")
-        lines.append(f"- Attacker (session_b) snippet: `{b_snip}`")
+        lines.append(f"- Rule fired: `{_escape_md(r['rule_fired'])}`")
+        lines.append(f"- Owner (session_a) snippet: `{_escape_md(a_snip)}`")
+        lines.append(f"- Attacker (session_b) snippet: `{_escape_md(b_snip)}`")
         lines.append("")
         lines.append("</details>")
         lines.append("")
 
-    if pii_redacted_any:
-        lines.insert(
-            1,
-            "\n⚠️ Some evidence was redacted to remove PII — review "
-            "replay_results.json locally before sharing this report.\n",
-        )
+    report_text = "\n".join(lines) + "\n"
+    # Final enforcement: redact again if anything slipped through
+    report_text = redact_pii(report_text)
+    # Also redact URLs in the final text
+    report_text = _URL_QUERY_SECRET_RE.sub(r"\1***", report_text)
 
-    return "\n".join(lines) + "\n"
+    if pii_redacted_any:
+        # Insert warning near top if not present
+        if "PII" not in report_text[:200]:
+            report_text = report_text.replace(
+                "# Phase 2 IDOR Report",
+                "# Phase 2 IDOR Report\n\n⚠️ Some evidence was redacted to remove PII — review replay_results.json locally before sharing this report.",
+                1,
+            )
+
+    return report_text
 
 
 def write_report_atomic(report_text: str, out_path: str) -> None:

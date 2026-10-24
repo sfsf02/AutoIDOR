@@ -23,15 +23,20 @@ from typing import Any, Optional
 
 ALLOWED_CONTENT_TYPES = {"application/json", "text/html", "text/plain"}
 
-# replay_error values that, per spec, count as NOT_VULNERABLE as long as
-# the attacker did NOT get the owner's object.
-NOT_VULNERABLE_REPLAY_ERRORS = {
+# replay_error values that indicate baseline/invalid state - these must be
+# treated as INCONCLUSIVE (baseline failure is not evidence of auth enforced).
+INCONCLUSIVE_BASELINE_ERRORS = {
     "baseline_drift",
     "auth_lost",
     "suspiciously_small",
     "budget_exceeded",
     "rate_limited",
+    "request_failed",
 }
+
+# Keep for backward compatibility if referenced, but we must not treat
+# baseline errors as NOT_VULNERABLE.
+NOT_VULNERABLE_REPLAY_ERRORS = set()
 
 OWNER_DENIED_STATUSES = (401, 403)
 
@@ -88,18 +93,27 @@ def classify_all(replay_results: dict) -> list[dict]:
         )
 
     preflight = replay_results["preflight"]
-    if not preflight.get("sessions_distinct", False):
+    if not isinstance(preflight, dict) or not preflight.get("sessions_distinct", False):
         raise AbortPhase2(
             "preflight.sessions_distinct is false: the owner and attacker "
             "sessions are the same account. Every finding would be meaningless."
         )
 
     results = replay_results.get("results", [])
+    if not isinstance(results, list):
+        raise StageCInputError(
+            f"replay_results['results'] must be a list, got {type(results).__name__}"
+        )
     return [classify_record(record) for record in results]
 
 
 def classify_record(record: dict) -> dict:
     """Classify a single Stage B record. Returns a phase2_results.json row."""
+    if not isinstance(record, dict):
+        raise StageCInputError(
+            f"Each result must be a dict, got {type(record).__name__}"
+        )
+
     candidate_id = record.get("candidate_id")
     if not candidate_id:
         raise StageCInputError(
@@ -115,10 +129,18 @@ def classify_record(record: dict) -> dict:
                 "from the documented Stage B schema - check with Daniel."
             )
 
-    session_a = record.get("session_a") or {}
-    session_b = record.get("session_b") or {}
-    delta = record.get("delta") or {}
+    session_a = record.get("session_a")
+    session_b = record.get("session_b")
+    delta = record.get("delta")
+    if not isinstance(session_a, dict) or not isinstance(session_b, dict) or not isinstance(delta, dict):
+        raise StageCInputError(
+            f"candidate_id={candidate_id}: session_a, session_b, and delta must be dicts"
+        )
     flags = record.get("flags") or []
+    if not isinstance(flags, list):
+        raise StageCInputError(
+            f"candidate_id={candidate_id}: flags must be a list if present"
+        )
     replay_error = record.get("replay_error")
     test_kind = record.get("test_kind", "credential_swap")
 
@@ -191,13 +213,18 @@ def _classify(
     redirected = delta.get("redirected_to_login", False)
 
     # 1. Owner unreachable -> can't trust anything else in this record.
-    if a_status in OWNER_DENIED_STATUSES:
+    if a_status in OWNER_DENIED_STATUSES or a_status == 0:
         return "INCONCLUSIVE", RULE_OWNER_UNREACHABLE
 
     # 2. Binary / unexpected content -> don't classify.
     for ct in (a_ct, b_ct):
-        if ct is not None and ct not in ALLOWED_CONTENT_TYPES:
+        if ct not in ALLOWED_CONTENT_TYPES:
             return "INCONCLUSIVE", RULE_UNEXPECTED_CONTENT_TYPE
+
+    # Baseline/invalid replay state must be INCONCLUSIVE (not treated as evidence of auth enforced)
+    if replay_error in INCONCLUSIVE_BASELINE_ERRORS:
+        rule = RULE_BASELINE_DRIFT if replay_error == "baseline_drift" else RULE_REPLAY_ERROR
+        return "INCONCLUSIVE", rule
 
     # 3. NOT_VULNERABLE
     if denied:
@@ -209,11 +236,7 @@ def _classify(
         return "NOT_VULNERABLE", RULE_BODY_IDENTICAL
 
     if status_changed and not got_owner_object:
-        return "NOT_VULNERABLE", RULE_IDENTIFIER_IGNORED
-
-    if replay_error in NOT_VULNERABLE_REPLAY_ERRORS and not got_owner_object:
-        rule = RULE_BASELINE_DRIFT if replay_error == "baseline_drift" else RULE_REPLAY_ERROR
-        return "NOT_VULNERABLE", rule
+        return "INCONCLUSIVE", RULE_IDENTIFIER_IGNORED
 
     # 4. POSSIBLE_IDOR - all conditions must hold.
     if (
@@ -232,7 +255,7 @@ def _classify(
     if redirected:
         return "INCONCLUSIVE", RULE_REDIRECT_TO_LOGIN
 
-    if replay_error is not None and replay_error not in NOT_VULNERABLE_REPLAY_ERRORS:
+    if replay_error is not None:
         return "INCONCLUSIVE", RULE_REPLAY_ERROR
 
     if a_size < 50 or b_size < 50:
