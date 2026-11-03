@@ -21,11 +21,15 @@ The output `captures/run-*/replay_results.json` strictly adheres to the Phase 2 
     - In-code request identity assertions: asserts request method, url, query, and body are byte-identical between sessions (only auth headers differ).
     - Rate limiting & budget caps: 1 req/sec globally, 1 req/2sec on list endpoints; exponential backoff on 429 (2s, 4s, 8s); hard cap `MAX_REQUESTS_PER_CANDIDATE = 4`.
     - Secret scrubbing and snippet truncation: trims body snippets to 512 bytes (or 128 bytes for HTML); scrubs JWTs, cookies, CSRF tokens, session keys, and email addresses. Never writes unredacted secrets to disk.
-    - Secondary signal: supports optional integer identifier mutation probes on Session A when configured (`test_kind="identifier_mutation"`).
+    - Secondary signal: supports integer, string, and file identifier mutation probes on Session A (`test_kind="identifier_mutation"`), with explicit baseline/mutated representation and safety checks.
+    - Full fidelity replay: replays captured headers, body content, and preserves identifier metadata.
+    - Session state reuse: properly parses raw/Bearer/JSON localStorage tokens and preserves authenticated session headers without masking.
+    - Preflight & Mutation safety: validates probe and mutated URLs against SCOPE_DOMAIN and destructive path filters.
+    - Request budget: counts all mutation retries toward the 4-request budget cap.
 - **`tests/mock_server.py`**:
   - Standalone threaded HTTP mock server implementing the Phase 2 specification routes (`/me`, `/users/1`, `/users/2`, `/public/info`, `/admin/users/1`) for automated and harness testing.
 - **`tests/test_replayer.py`**:
-  - 19 automated tests covering all 8 blocking safety guards, behavior cases (baseline drift, small response, denied, identical body, possible IDOR), and the end-to-end acceptance criteria against the mock server.
+  - 31 automated tests covering all blocking safety guards, behavior cases (baseline drift, small response, denied, identical body, possible IDOR), review fixes (localStorage tokens, string/file selectors, fidelity replay, preflight scope, mutation safety and budget, Location redirect check, explicit failure records), and the end-to-end acceptance criteria against the mock server.
 
 ## Phase 1 Changes (Reference)
 

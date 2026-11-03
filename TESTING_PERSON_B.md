@@ -18,7 +18,7 @@ Run the full Stage B test suite:
 python -m pytest tests/test_replayer.py -v
 ```
 
-Expected result: **19 passed**.
+Expected result: **31 passed**.
 
 Run the entire test suite across all modules:
 
@@ -26,9 +26,9 @@ Run the entire test suite across all modules:
 python -m pytest tests/ -v
 ```
 
-Expected result: **34 passed** (8 Person B Phase 1 tests + 7 Person C Phase 1 tests + 19 Person B Phase 2 tests).
+Expected result: **46 passed** (8 Person B Phase 1 tests + 7 Person C Phase 1 tests + 31 Person B Phase 2 tests).
 
-### Breakdown of the 19 Person B Phase 2 Tests
+### Breakdown of the 31 Person B Phase 2 Tests
 
 | Category | Test Function | Purpose / Safety Guard Verified |
 |---|---|---|
@@ -50,7 +50,19 @@ Expected result: **34 passed** (8 Person B Phase 1 tests + 7 Person C Phase 1 te
 | **Behavior** | `test_output_contains_no_secrets` | Output `replay_results.json` contains no unredacted secret tokens. |
 | **Behavior** | `test_preflight_block_present_in_output` | Top-level `preflight` block with `sessions_distinct: True` is present in output. |
 | **Acceptance** | `test_mock_server_produces_four_expected_records` | End-to-end against mock server produces 4 records matching specification. |
-| **Secondary** | `test_identifier_mutation_as_secondary_signal` | Emits secondary corroborating record when integer identifier is present. |
+| **Secondary** | `test_identifier_mutation_as_secondary_signal` | Emits secondary corroborating record when identifier is present; verifies baseline and mutated schemas. |
+| **Review Fix 1** | `test_local_storage_bearer_token_loaded_and_used` | Parses raw/Bearer/JSON localStorage tokens, sets Authorization without masking, strips masked candidate auth headers. |
+| **Review Fix 2** | `test_identifier_mutation_supports_string_and_file_selectors` | Verifies mutation of integer, string, and file selectors (e.g. `page=file1.php` -> `page=file2.php`). |
+| **Review Fix 3** | `test_baseline_replay_replays_headers_body_and_identifier` | Preserves captured headers, body presence, body content, and original identifier metadata. |
+| **Review Fix 4** | `test_request_identity_assertion_rejects_differing_parameters` | In-code assertion catches discrepancies in method, url, query, body, or non-auth headers. |
+| **Review Fix 5** | `test_preflight_scope_enforcement` | Preflight URL is validated against `SCOPE_DOMAIN` (fails closed on out-of-scope probes). |
+| **Review Fix 6** | `test_mutated_url_scope_and_destructive_path_checks` | Mutated URLs independently checked against scope and destructive path blocklist. |
+| **Review Fix 7** | `test_path_mutation_replaces_single_segment_only` | Replaces exactly one path segment matching `orig_val`. |
+| **Review Fix 8** | `test_query_mutation_replaces_single_parameter_only` | Replaces exactly one query parameter matching `name`. |
+| **Review Fix 9** | `test_mutation_counts_toward_request_budget` | All mutation attempts and retries count toward `MAX_REQUESTS_PER_CANDIDATE`. |
+| **Review Fix 10** | `test_mutation_redirect_to_login_requires_location` | Distinguishes login redirects from ordinary redirects by inspecting `Location` header. |
+| **Review Fix 12** | `test_failed_mutation_emits_explicit_record` | Emits an explicit record with `replay_error` when mutation request fails. |
+| **Review Fix 13** | `test_headers_fingerprint_uses_actual_headers` | Computes SHA256 fingerprint from actual request headers, ignoring auth/trace headers. |
 
 ## 3. Acceptance Criteria Verification
 

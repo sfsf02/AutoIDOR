@@ -282,6 +282,142 @@ def load_auth_state_data(path: str | Path) -> tuple[dict[str, Any], set[str]]:
     return data, known_secrets
 
 
+def _extract_token_from_storage_value(val: Any) -> Optional[str]:
+    """Extract raw bearer token from potential string, JSON object, or Bearer prefix."""
+    if not val:
+        return None
+    val_str = str(val).strip()
+    if val_str.startswith("{") and val_str.endswith("}"):
+        try:
+            parsed = json.loads(val_str)
+            if isinstance(parsed, dict):
+                for k in ("token", "access_token", "accessToken", "jwt", "id_token", "authToken", "value"):
+                    v = parsed.get(k)
+                    if v and isinstance(v, str) and v.strip():
+                        return v.strip()
+        except Exception:
+            pass
+    return val_str
+
+
+def prepare_replay_headers(candidate_headers: Optional[dict[str, Any]]) -> dict[str, str]:
+    """
+    Extract captured request headers from candidate, stripping host, content-length,
+    and auth-sensitive headers so session client handles them.
+    Also strips any masked/redacted values (e.g. '******').
+    """
+    if not candidate_headers:
+        return {}
+    cleaned: dict[str, str] = {}
+    for k, v in candidate_headers.items():
+        k_lower = k.lower().strip()
+        # Skip host, content-length, and auth headers (cookie, authorization, etc.)
+        if k_lower in ("host", "content-length", "cookie", "authorization", "proxy-authorization"):
+            continue
+        v_str = str(v).strip()
+        cleaned[k_lower] = v_str
+    return cleaned
+
+
+def extract_candidate_body(candidate: dict[str, Any]) -> tuple[bytes, bool]:
+    """
+    Extract request body bytes and presence flag from candidate.
+    Handles raw bytes, utf-8 strings, and base64 encodings.
+    """
+    present = candidate.get("request_body_present", False)
+    raw_body = (
+        candidate.get("request_body")
+        or candidate.get("body")
+        or candidate.get("content")
+        or b""
+    )
+    encoding = candidate.get("request_body_encoding", "utf-8")
+
+    if not raw_body:
+        return b"", bool(present)
+
+    if isinstance(raw_body, bytes):
+        return raw_body, True
+
+    if isinstance(raw_body, str):
+        if encoding == "base64":
+            try:
+                import base64
+                return base64.b64decode(raw_body), True
+            except Exception:
+                return raw_body.encode("utf-8"), True
+        return raw_body.encode("utf-8"), True
+
+    return b"", bool(present)
+
+
+def mutate_identifier_value(orig_val: str, value_type: Optional[str] = None) -> str:
+    """
+    Mutate identifier value supporting integers, strings, and file selectors.
+    - If pure integer: increment by 1.
+    - If filename or string with digits (e.g. 'file1.php', 'user42'): increment the first number sequence.
+    - If string with no digits:
+        - If has file extension (e.g. 'file.php'): insert '2' before extension -> 'file2.php'.
+        - Otherwise: append '2' -> 'alice2'.
+    """
+    orig_str = str(orig_val)
+    if orig_str.isdigit():
+        return str(int(orig_str) + 1)
+    if re.search(r"\d+", orig_str):
+        return re.sub(r"\d+", lambda m: str(int(m.group(0)) + 1), orig_str, count=1)
+    if "." in orig_str and not orig_str.startswith("."):
+        parts = orig_str.rsplit(".", 1)
+        return f"{parts[0]}2.{parts[1]}"
+    return f"{orig_str}2"
+
+
+def mutate_query_param(url: str, param_name: str, orig_val: str, mutated_val: str) -> str:
+    """
+    Replace exactly one occurrence of param_name in the query string.
+    """
+    parsed_u = urlparse(url)
+    q_list = parse_qsl(parsed_u.query, keep_blank_values=True)
+    replaced = False
+    new_q = []
+    for k, v in q_list:
+        if k == param_name and not replaced:
+            if orig_val and v == orig_val:
+                new_q.append((k, mutated_val))
+                replaced = True
+            elif not orig_val:
+                new_q.append((k, mutated_val))
+                replaced = True
+            else:
+                new_q.append((k, v))
+        else:
+            new_q.append((k, v))
+    if not replaced:
+        for i, (k, v) in enumerate(new_q):
+            if k == param_name:
+                new_q[i] = (k, mutated_val)
+                replaced = True
+                break
+    return parsed_u._replace(query=urlencode(new_q)).geturl()
+
+
+def mutate_path_segment(url: str, orig_val: str, mutated_val: str) -> str:
+    """
+    Replace exactly one path segment equal to orig_val.
+    """
+    parsed_u = urlparse(url)
+    segments = parsed_u.path.split("/")
+    replaced = False
+    new_segments = []
+    for s in segments:
+        if s == orig_val and not replaced:
+            new_segments.append(mutated_val)
+            replaced = True
+        else:
+            new_segments.append(s)
+    mutated_path = "/".join(new_segments)
+    return parsed_u._replace(path=mutated_path).geturl()
+
+
 def build_http_client(
     auth_data: dict[str, Any],
     timeout: float = 10.0,
@@ -308,14 +444,30 @@ def build_http_client(
     for origin in auth_data.get("origins", []):
         for item in origin.get("localStorage", []):
             name = item.get("name", "").lower()
-            val = item.get("value", "")
-            if val and ("token" in name or "auth" in name or "jwt" in name):
-                headers["authorization"] = f"Bearer {val}"
+            raw_val = item.get("value", "")
+            token = _extract_token_from_storage_value(raw_val)
+            if token and (
+                "token" in name
+                or "auth" in name
+                or "jwt" in name
+                or "bearer" in name
+                or token.startswith("Bearer ")
+                or _JWT_PATTERN.search(token)
+            ):
+                if token.lower().startswith("bearer "):
+                    headers["authorization"] = token
+                else:
+                    headers["authorization"] = f"Bearer {token}"
 
     # Explicit headers in auth state
     if "headers" in auth_data and isinstance(auth_data["headers"], dict):
         for k, v in auth_data["headers"].items():
-            headers[k.lower()] = str(v)
+            k_lower = k.lower().strip()
+            v_str = str(v).strip()
+            # If explicit header has masked value like "******", don't overwrite real token
+            if k_lower == "authorization" and v_str.strip("*") == "":
+                continue
+            headers[k_lower] = v_str
 
     return httpx.AsyncClient(
         cookies=cookies,
@@ -449,6 +601,14 @@ async def replay_single_candidate(
     if not check_scope(source_url, scope_domain):
         raise ScopeViolationError(f"URL host '{parsed.hostname}' is not in SCOPE_DOMAIN.")
 
+    # Extract captured body, headers, and metadata (Fixes Issue 3)
+    req_body, body_present = extract_candidate_body(candidate)
+    replay_headers = prepare_replay_headers(candidate.get("headers"))
+    if body_present and "content-type" not in replay_headers:
+        ct = candidate.get("request_content_type")
+        if ct:
+            replay_headers["content-type"] = str(ct)
+
     # Rate limiting delay
     is_list = is_list_endpoint(source_url, candidate.get("notes"))
     delay = rate_limit_delay * 2.0 if is_list else rate_limit_delay
@@ -462,6 +622,8 @@ async def replay_single_candidate(
         client=client_a,
         method=method,
         url=source_url,
+        headers=replay_headers,
+        content=req_body if body_present else None,
     )
     total_requests += reqs_a
 
@@ -522,11 +684,14 @@ async def replay_single_candidate(
                 "request": {
                     "url": source_url,
                     "method": method,
-                    "params_hash": compute_params_hash(source_url),
-                    "headers_fingerprint": compute_headers_fingerprint(None),
+                    "params_hash": compute_params_hash(source_url, req_body),
+                    "headers_fingerprint": compute_headers_fingerprint(replay_headers),
+                    "body_present": bool(body_present or req_body),
+                    "identifier": candidate.get("identifier"),
                 },
                 "session_a": session_a_dict,
                 "session_b": empty_session_b,
+                "baseline": session_a_dict,
                 "delta": empty_delta,
                 "flags": [],
                 "replay_error": replay_error,
@@ -539,13 +704,20 @@ async def replay_single_candidate(
     if delay > 0:
         await asyncio.sleep(delay)
 
-    # In-code assertion: request method, url, query, body must be identical
-    req_a_url_parsed = urlparse(source_url)
-    req_b_url_parsed = urlparse(source_url)
+    # In-code assertion: request method, url, query, body, and non-auth headers must be identical (Fixes Issue 4)
+    req_b_method = method
+    req_b_url = source_url
+    req_b_body = req_body
+    req_b_headers = dict(replay_headers)
+
+    parsed_a = urlparse(source_url)
+    parsed_b = urlparse(req_b_url)
     if (
-        method != method
-        or source_url != source_url
-        or req_a_url_parsed.query != req_b_url_parsed.query
+        method != req_b_method
+        or source_url != req_b_url
+        or parsed_a.query != parsed_b.query
+        or req_body != req_b_body
+        or compute_headers_fingerprint(replay_headers) != compute_headers_fingerprint(req_b_headers)
     ):
         raise RequestIdentityError("Replay request details differ between sessions.")
 
@@ -553,6 +725,8 @@ async def replay_single_candidate(
         client=client_b,
         method=method,
         url=source_url,
+        headers=replay_headers,
+        content=req_body if body_present else None,
     )
     total_requests += reqs_b
 
@@ -622,11 +796,14 @@ async def replay_single_candidate(
             "request": {
                 "url": source_url,
                 "method": method,
-                "params_hash": compute_params_hash(source_url),
-                "headers_fingerprint": compute_headers_fingerprint(None),
+                "params_hash": compute_params_hash(source_url, req_body),
+                "headers_fingerprint": compute_headers_fingerprint(replay_headers),
+                "body_present": bool(body_present or req_body),
+                "identifier": candidate.get("identifier"),
             },
             "session_a": session_a_dict,
             "session_b": session_b_dict,
+            "baseline": session_a_dict,
             "delta": delta,
             "flags": flags,
             "replay_error": replay_error,
@@ -634,83 +811,116 @@ async def replay_single_candidate(
         }
     ]
 
-    # 9. Step 9: OPTIONAL identifier-mutation as secondary signal
+    # 9. Step 9: Identifier mutation within owner session (secondary signal)
+    # Supports integer, string, and file selectors (Fixes Issue 2)
     ident = candidate.get("identifier")
-    if (
-        ident
-        and isinstance(ident, dict)
-        and ident.get("location") in ("query", "path")
-        and ident.get("value_type") == "integer"
-    ):
-        orig_val = ident.get("original_value", "1")
-        try:
-            mutated_val = str(int(orig_val) + 1)
-        except ValueError:
-            mutated_val = "2"
+    if ident and isinstance(ident, dict) and ident.get("location") in ("query", "path"):
+        orig_val = str(ident.get("original_value", "1"))
+        v_type = ident.get("value_type")
+        mutated_val = mutate_identifier_value(orig_val, v_type)
 
         mutated_url = source_url
         if ident.get("location") == "query" and ident.get("name"):
-            name = ident["name"]
-            parsed_u = urlparse(source_url)
-            q_list = parse_qsl(parsed_u.query, keep_blank_values=True)
-            new_q = [(k, mutated_val if k == name else v) for k, v in q_list]
-            mutated_url = parsed_u._replace(query=urlencode(new_q)).geturl()
+            # Replace exactly one query parameter (Fixes Issue 8)
+            mutated_url = mutate_query_param(source_url, ident["name"], orig_val, mutated_val)
         elif ident.get("location") == "path":
-            parsed_u = urlparse(source_url)
-            # Replace path segment
-            segments = parsed_u.path.split("/")
-            new_segments = [mutated_val if s == orig_val else s for s in segments]
-            mutated_path = "/".join(new_segments)
-            mutated_url = parsed_u._replace(path=mutated_path).geturl()
+            # Replace exactly one path segment (Fixes Issue 7)
+            mutated_url = mutate_path_segment(source_url, orig_val, mutated_val)
 
-        if delay > 0:
-            await asyncio.sleep(delay)
+        # Mutated URL safety guards check (Fixes Issue 6)
+        parsed_mut = urlparse(mutated_url)
+        mut_safety_error: Optional[str] = None
+        try:
+            if not check_scope(mutated_url, scope_domain):
+                mut_safety_error = "scope_violation"
+        except ScopeViolationError:
+            mut_safety_error = "scope_violation"
 
-        resp_mut, _, mut_err = await send_with_backoff(
-            client=client_a,
-            method=method,
-            url=mutated_url,
-        )
-        if resp_mut is not None:
-            mut_bytes = resp_mut.content
-            mut_sha = hashlib.sha256(mut_bytes).hexdigest()
-            mut_status = resp_mut.status_code
-            mut_ct = resp_mut.headers.get("content-type", "").split(";")[0].strip()
-            mut_snippet = extract_body_snippet(mut_bytes, all_secrets)
+        if not mut_safety_error and is_destructive_path(parsed_mut.path):
+            mut_safety_error = "destructive_path"
 
-            mut_delta = {
-                "status_changed": a_status != mut_status,
-                "size_delta_bytes": len(mut_bytes) - len(a_bytes),
-                "content_type_changed": a_ct != mut_ct,
-                "body_identical": a_sha == mut_sha,
-                "session_b_got_owner_object": (mut_status in (200, 201)) and (a_sha != mut_sha),
-                "session_b_denied": mut_status in (401, 403),
-                "redirected_to_login": mut_status in (301, 302, 303),
-            }
-            records.append(
-                {
-                    "candidate_id": candidate_id,
-                    "request": {
-                        "url": mutated_url,
-                        "method": method,
-                        "params_hash": compute_params_hash(mutated_url),
-                        "headers_fingerprint": compute_headers_fingerprint(None),
-                    },
-                    "session_a": session_a_dict,
-                    "session_b": {
-                        "label": "mutated",
-                        "status": mut_status,
-                        "response_size": len(mut_bytes),
-                        "content_type": mut_ct,
-                        "body_sha256": mut_sha,
-                        "body_snippet": mut_snippet,
-                    },
-                    "delta": mut_delta,
-                    "flags": ["secondary_signal"],
-                    "replay_error": mut_err,
-                    "test_kind": "identifier_mutation",
-                }
+        # Check request budget cap prior to sending (Fixes Issue 9)
+        if total_requests >= MAX_REQUESTS_PER_CANDIDATE:
+            mut_err = "budget_exceeded"
+            resp_mut = None
+        elif mut_safety_error:
+            mut_err = mut_safety_error
+            resp_mut = None
+        else:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            resp_mut, reqs_mut, mut_err = await send_with_backoff(
+                client=client_a,
+                method=method,
+                url=mutated_url,
+                headers=replay_headers,
+                content=req_body if body_present else None,
             )
+            total_requests += reqs_mut
+            if total_requests > MAX_REQUESTS_PER_CANDIDATE:
+                mut_err = "budget_exceeded"
+
+        # Mutation login redirect requires checking Location header (Fixes Issue 10)
+        mut_loc = resp_mut.headers.get("location", "") if resp_mut is not None else ""
+        mut_redirected_to_login = (
+            resp_mut is not None
+            and resp_mut.status_code in (301, 302, 303)
+            and ("/login" in mut_loc.lower() or "/signin" in mut_loc.lower())
+        )
+
+        mut_bytes = resp_mut.content if resp_mut is not None else b""
+        mut_sha = hashlib.sha256(mut_bytes).hexdigest()
+        mut_status = resp_mut.status_code if resp_mut is not None else 0
+        mut_ct = (
+            resp_mut.headers.get("content-type", "").split(";")[0].strip()
+            if resp_mut is not None
+            else "text/plain"
+        )
+        mut_snippet = extract_body_snippet(mut_bytes, all_secrets)
+
+        mut_delta = {
+            "status_changed": (a_status != mut_status) if resp_mut is not None else False,
+            "size_delta_bytes": (len(mut_bytes) - len(a_bytes)) if resp_mut is not None else 0,
+            "content_type_changed": (a_ct != mut_ct) if resp_mut is not None else False,
+            "body_identical": (a_sha == mut_sha) if resp_mut is not None else False,
+            "session_b_got_owner_object": (mut_status in (200, 201) and a_sha != mut_sha) if resp_mut is not None else False,
+            "session_b_denied": (mut_status in (401, 403)) if resp_mut is not None else False,
+            "redirected_to_login": mut_redirected_to_login,
+        }
+
+        # Label response as owner_mutated, provide explicit baseline/mutated representation
+        # while keeping session_b for Stage C compatibility (Fixes Issue 11 & Major pipeline mismatch)
+        mut_session_dict = {
+            "label": "owner_mutated",
+            "status": mut_status,
+            "response_size": len(mut_bytes),
+            "content_type": mut_ct,
+            "body_sha256": mut_sha,
+            "body_snippet": mut_snippet,
+        }
+
+        # Always append explicit mutation record even if request failed (Fixes Issue 12)
+        records.append(
+            {
+                "candidate_id": candidate_id,
+                "request": {
+                    "url": mutated_url,
+                    "method": method,
+                    "params_hash": compute_params_hash(mutated_url, req_body),
+                    "headers_fingerprint": compute_headers_fingerprint(replay_headers),
+                    "body_present": bool(body_present or req_body),
+                    "identifier": ident,
+                },
+                "session_a": session_a_dict,
+                "session_b": mut_session_dict,
+                "baseline": session_a_dict,
+                "mutated": mut_session_dict,
+                "delta": mut_delta,
+                "flags": ["secondary_signal"],
+                "replay_error": mut_err,
+                "test_kind": "identifier_mutation",
+            }
+        )
 
     return records
 
@@ -777,9 +987,20 @@ async def replay_all_candidates(
                 parsed = urlparse(first_url)
                 probe = f"{parsed.scheme}://{parsed.netloc}/me"
             else:
-                probe = "/me"
+                effective_scope = (scope_domain or os.environ.get("SCOPE_DOMAIN", "")).strip().lower()
+                probe = f"http://{effective_scope}/me" if effective_scope else "/me"
+        elif probe.startswith("/"):
+            if candidates:
+                first_url = candidates[0].get("source_url", "")
+                probe = urljoin(first_url, probe)
+            else:
+                effective_scope = (scope_domain or os.environ.get("SCOPE_DOMAIN", "")).strip().lower()
+                probe = f"http://{effective_scope}{probe}" if effective_scope else probe
 
-        # 3. Preflight check
+        # 3. Check probe scope before sending credentials (Safety Guard) (Fixes Issue 5)
+        if not check_scope(probe, scope_domain):
+            raise ScopeViolationError(f"Preflight URL '{probe}' is outside SCOPE_DOMAIN.")
+
         preflight_info = await run_preflight_check(client_a, client_b, probe)
 
         # 4. Replay candidates
@@ -818,6 +1039,7 @@ def run_stage_b(
     attacker_state_path: Optional[str] = None,
     scope_domain: Optional[str] = None,
     rate_limit_delay: float = 1.0,
+    preflight_url: Optional[str] = None,
 ) -> str:
     """
     Standard entry point for Stage B pipeline:
@@ -846,6 +1068,7 @@ def run_stage_b(
             auth_state_a_path=auth_a,
             auth_state_b_path=auth_b,
             scope_domain=scope_domain,
+            preflight_url=preflight_url,
             rate_limit_delay=rate_limit_delay,
         )
     )

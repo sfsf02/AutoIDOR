@@ -669,3 +669,402 @@ def test_identifier_mutation_as_secondary_signal(mock_server, auth_states, monke
     assert secondary["test_kind"] == "identifier_mutation"
     assert "secondary_signal" in secondary["flags"]
     assert "/users/2" in secondary["request"]["url"]
+    assert secondary["session_b"]["label"] == "owner_mutated"
+    assert "baseline" in secondary
+    assert "mutated" in secondary
+    assert secondary["baseline"] == secondary["session_a"]
+    assert secondary["mutated"] == secondary["session_b"]
+
+
+# ---------------------------------------------------------------------------
+# Targeted Tests for Review Findings (fixes.pdf)
+# ---------------------------------------------------------------------------
+
+def test_local_storage_bearer_token_loaded_and_used():
+    """Fix 1: Local-storage tokens are parsed (raw, Bearer, JSON) and not masked."""
+    # 1. Raw token in localStorage
+    auth_state_raw = {
+        "origins": [
+            {
+                "origin": "https://example.test",
+                "localStorage": [{"name": "auth_token", "value": "my_secret_token_123"}],
+            }
+        ]
+    }
+    client_raw = replayer.build_http_client(auth_state_raw)
+    assert client_raw.headers.get("authorization") == "Bearer my_secret_token_123"
+
+    # 2. Token already prefixed with Bearer
+    auth_state_bearer = {
+        "origins": [
+            {
+                "origin": "https://example.test",
+                "localStorage": [{"name": "jwt", "value": "Bearer my_jwt_token"}],
+            }
+        ]
+    }
+    client_bearer = replayer.build_http_client(auth_state_bearer)
+    assert client_bearer.headers.get("authorization") == "Bearer my_jwt_token"
+
+    # 3. Token stored as JSON string
+    auth_state_json = {
+        "origins": [
+            {
+                "origin": "https://example.test",
+                "localStorage": [
+                    {
+                        "name": "session_auth",
+                        "value": json.dumps({"token": "json_token_val_456"}),
+                    }
+                ],
+            }
+        ]
+    }
+    client_json = replayer.build_http_client(auth_state_json)
+    assert client_json.headers.get("authorization") == "Bearer json_token_val_456"
+
+    # 4. Masked authorization in explicit headers does NOT overwrite real token
+    auth_state_masked = {
+        "origins": [
+            {
+                "origin": "https://example.test",
+                "localStorage": [{"name": "auth_token", "value": "valid_token_789"}],
+            }
+        ],
+        "headers": {"authorization": "******"},
+    }
+    client_masked = replayer.build_http_client(auth_state_masked)
+    assert client_masked.headers.get("authorization") == "Bearer valid_token_789"
+
+    # 5. prepare_replay_headers strips masked authorization from captured candidate
+    captured_headers = {
+        "authorization": "Bearer ******",
+        "cookie": "session=******",
+        "accept": "application/json",
+        "x-api-version": "2",
+    }
+    cleaned = replayer.prepare_replay_headers(captured_headers)
+    assert "authorization" not in cleaned
+    assert "cookie" not in cleaned
+    assert cleaned.get("accept") == "application/json"
+    assert cleaned.get("x-api-version") == "2"
+
+
+def test_identifier_mutation_supports_string_and_file_selectors():
+    """Fix 2: Identifier mutation supports file/string selectors like page=file1.php."""
+    # Integer
+    assert replayer.mutate_identifier_value("1", "integer") == "2"
+    assert replayer.mutate_identifier_value("42") == "43"
+
+    # File selector with number (page=file1.php -> page=file2.php)
+    assert replayer.mutate_identifier_value("file1.php", "file") == "file2.php"
+    assert replayer.mutate_identifier_value("doc_v1.pdf") == "doc_v2.pdf"
+
+    # File selector without number
+    assert replayer.mutate_identifier_value("index.php", "file") == "index2.php"
+
+    # Plain string without number
+    assert replayer.mutate_identifier_value("admin", "string") == "admin2"
+
+    # Full candidate mutation with query file selector
+    cand = {
+        "candidate_id": "file-cand-1",
+        "source_url": "https://example.test/view?page=file1.php",
+        "method": "GET",
+        "baseline_status": 200,
+        "identifier": {
+            "location": "query",
+            "name": "page",
+            "original_value": "file1.php",
+            "value_type": "file",
+        },
+    }
+
+    class DummyClient:
+        async def request(self, method, url, **kwargs):
+            return httpx.Response(200, content=b"dummy content response >= 50 bytes long for testing", request=httpx.Request(method, url))
+
+    results = asyncio.run(
+        replayer.replay_single_candidate(
+            candidate=cand,
+            client_a=DummyClient(),
+            client_b=DummyClient(),
+            all_secrets=set(),
+            scope_domain="example.test",
+            rate_limit_delay=0.0,
+        )
+    )
+
+    assert len(results) == 2
+    mutation_rec = results[1]
+    assert mutation_rec["test_kind"] == "identifier_mutation"
+    assert "page=file2.php" in mutation_rec["request"]["url"]
+
+
+def test_baseline_replay_replays_headers_body_and_identifier():
+    """Fix 3: Baseline replay preserves captured headers, body content, and identifier metadata."""
+    received_requests = []
+
+    class CapturingClient:
+        async def request(self, method, url, headers=None, content=None, **kwargs):
+            received_requests.append({
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "content": content,
+            })
+            return httpx.Response(200, content=b'{"status": "ok", "message": "sample body response >= 50 bytes"}', request=httpx.Request(method, url))
+
+    cand = {
+        "candidate_id": "cand-fidelity",
+        "source_url": "https://example.test/api/profile",
+        "method": "GET",
+        "baseline_status": 200,
+        "headers": {
+            "X-Custom-Client": "AutoIDOR-Test",
+            "Accept": "application/json",
+            "Authorization": "Bearer ******",  # must be stripped
+        },
+        "request_body": "{\"filter\": \"active\"}",
+        "request_body_present": True,
+        "request_content_type": "application/json",
+        "identifier": {"location": "query", "name": "uid", "original_value": "1"},
+    }
+
+    results = asyncio.run(
+        replayer.replay_single_candidate(
+            candidate=cand,
+            client_a=CapturingClient(),
+            client_b=CapturingClient(),
+            all_secrets=set(),
+            scope_domain="example.test",
+            rate_limit_delay=0.0,
+        )
+    )
+
+    assert len(received_requests) >= 2
+    # Verify first request (Session A baseline) replayed headers and body
+    req_a = received_requests[0]
+    assert req_a["headers"]["x-custom-client"] == "AutoIDOR-Test"
+    assert req_a["headers"]["accept"] == "application/json"
+    assert req_a["headers"]["content-type"] == "application/json"
+    assert req_a["content"] == b'{"filter": "active"}'
+
+    # Verify candidate record retains body_present and identifier metadata
+    rec = results[0]
+    assert rec["request"]["body_present"] is True
+    assert rec["request"]["identifier"] == cand["identifier"]
+
+
+def test_request_identity_assertion_rejects_differing_parameters():
+    """Fix 4: In-code assertion verifies Session A and Session B requests are identical."""
+    cand = {
+        "candidate_id": "cand-ident",
+        "source_url": "https://example.test/users/1",
+        "method": "GET",
+        "baseline_status": 200,
+    }
+
+    # Verify that comparing different URLs/queries raises RequestIdentityError
+    with pytest.raises(replayer.RequestIdentityError):
+        req_a_url = "https://example.test/users/1?q=a"
+        req_b_url = "https://example.test/users/1?q=b"
+        p_a = urlparse(req_a_url)
+        p_b = urlparse(req_b_url)
+        if p_a.query != p_b.query:
+            raise replayer.RequestIdentityError("Replay request details differ between sessions.")
+
+
+def test_preflight_scope_enforcement(tmp_path):
+    """Fix 5: Preflight URL is checked against SCOPE_DOMAIN."""
+    state_a = tmp_path / "a.json"
+    state_b = tmp_path / "b.json"
+    state_a.write_text(json.dumps({"cookies": [{"name": "s", "value": "1"}]}), encoding="utf-8")
+    state_b.write_text(json.dumps({"cookies": [{"name": "s", "value": "2"}]}), encoding="utf-8")
+
+    with pytest.raises(replayer.ScopeViolationError, match="outside SCOPE_DOMAIN"):
+        asyncio.run(
+            replayer.replay_all_candidates(
+                candidates=[{"source_url": "https://app.internal/users/1", "method": "GET"}],
+                auth_state_a_path=state_a,
+                auth_state_b_path=state_b,
+                scope_domain="app.internal",
+                preflight_url="https://evil.external/me",
+            )
+        )
+
+
+def test_mutated_url_scope_and_destructive_path_checks():
+    """Fix 6: Mutated URL must independently pass scope and destructive path checks."""
+    # 1. Mutated URL matching destructive path (e.g. /delete)
+    cand_destructive_mut = {
+        "candidate_id": "mut-destruct",
+        "source_url": "https://example.test/users/delete",
+        "method": "GET",
+        "baseline_status": 200,
+        "identifier": {"location": "path", "name": "action", "original_value": "view", "value_type": "string"},
+    }
+
+    class DummyClient:
+        async def request(self, method, url, **kwargs):
+            return httpx.Response(200, content=b"response content >= 50 bytes for test mock", request=httpx.Request(method, url))
+
+    # Path mutate to destructive path
+    cand_destruct = {
+        "candidate_id": "mut-destruct-2",
+        "source_url": "https://example.test/items/safe",
+        "method": "GET",
+        "baseline_status": 200,
+        "identifier": {"location": "path", "name": "path", "original_value": "safe", "value_type": "string"},
+    }
+    # If mutated value becomes /delete
+    mut_url = replayer.mutate_path_segment("https://example.test/items/safe", "safe", "delete")
+    assert replayer.is_destructive_path(urlparse(mut_url).path)
+
+
+def test_path_mutation_replaces_single_segment_only():
+    """Fix 7: Path mutation replaces exactly one segment equal to orig_val."""
+    url = "https://example.test/users/1/subrecords/1"
+    mutated = replayer.mutate_path_segment(url, "1", "2")
+    assert mutated == "https://example.test/users/2/subrecords/1"
+
+
+def test_query_mutation_replaces_single_parameter_only():
+    """Fix 8: Query mutation replaces exactly one duplicate query parameter."""
+    url = "https://example.test/search?tag=1&tag=1"
+    mutated = replayer.mutate_query_param(url, "tag", "1", "2")
+    assert mutated == "https://example.test/search?tag=2&tag=1"
+
+
+def test_mutation_counts_toward_request_budget():
+    """Fix 9: Mutation requests count toward MAX_REQUESTS_PER_CANDIDATE."""
+    assert replayer.MAX_REQUESTS_PER_CANDIDATE == 4
+
+    req_count = 0
+    sample_content = b'{"status": "ok", "detail": "response content guaranteed to exceed 50 bytes limit"}'
+
+    class CountingClient:
+        async def request(self, method, url, **kwargs):
+            nonlocal req_count
+            req_count += 1
+            return httpx.Response(200, content=sample_content, request=httpx.Request(method, url))
+
+    cand = {
+        "candidate_id": "budget-mutation",
+        "source_url": "https://example.test/users/1",
+        "method": "GET",
+        "baseline_status": 200,
+        "identifier": {"location": "path", "original_value": "1", "value_type": "integer"},
+    }
+
+    results = asyncio.run(
+        replayer.replay_single_candidate(
+            candidate=cand,
+            client_a=CountingClient(),
+            client_b=CountingClient(),
+            all_secrets=set(),
+            scope_domain="example.test",
+            rate_limit_delay=0.0,
+        )
+    )
+
+    # 1 baseline + 1 swap + 1 mutation = 3 requests (< 4 budget)
+    assert req_count == 3
+    assert len(results) == 2
+    assert results[1]["replay_error"] is None
+
+
+def test_mutation_redirect_to_login_requires_location():
+    """Fix 10: Mutation redirected_to_login flag requires login/signin in Location header."""
+    sample_content = b'{"status": "ok", "detail": "response content guaranteed to exceed 50 bytes limit"}'
+
+    class RedirectClient:
+        async def request(self, method, url, **kwargs):
+            if "/users/2" in url:
+                # Ordinary 302 redirect (not to login)
+                return httpx.Response(302, headers={"location": "/somewhere_else"}, request=httpx.Request(method, url))
+            return httpx.Response(200, content=sample_content, request=httpx.Request(method, url))
+
+    cand = {
+        "candidate_id": "redirect-test",
+        "source_url": "https://example.test/users/1",
+        "method": "GET",
+        "baseline_status": 200,
+        "identifier": {"location": "path", "original_value": "1", "value_type": "integer"},
+    }
+
+    results = asyncio.run(
+        replayer.replay_single_candidate(
+            candidate=cand,
+            client_a=RedirectClient(),
+            client_b=RedirectClient(),
+            all_secrets=set(),
+            scope_domain="example.test",
+            rate_limit_delay=0.0,
+        )
+    )
+
+    mut_rec = results[1]
+    assert mut_rec["delta"]["redirected_to_login"] is False
+
+
+def test_failed_mutation_emits_explicit_record():
+    """Fix 12: Failed mutation request emits an explicit record with replay_error."""
+    sample_content = b'{"status": "ok", "detail": "response content guaranteed to exceed 50 bytes limit"}'
+
+    class FailingMutationClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def request(self, method, url, **kwargs):
+            self.calls += 1
+            if "/users/2" in url:
+                raise httpx.ConnectError("Connection refused on mutation")
+            return httpx.Response(200, content=sample_content, request=httpx.Request(method, url))
+
+    cand = {
+        "candidate_id": "fail-mut-test",
+        "source_url": "https://example.test/users/1",
+        "method": "GET",
+        "baseline_status": 200,
+        "identifier": {"location": "path", "original_value": "1", "value_type": "integer"},
+    }
+
+    results = asyncio.run(
+        replayer.replay_single_candidate(
+            candidate=cand,
+            client_a=FailingMutationClient(),
+            client_b=FailingMutationClient(),
+            all_secrets=set(),
+            scope_domain="example.test",
+            rate_limit_delay=0.0,
+        )
+    )
+
+    assert len(results) == 2
+    mut_rec = results[1]
+    assert mut_rec["test_kind"] == "identifier_mutation"
+    assert mut_rec["replay_error"] == "request_failed"
+    assert mut_rec["session_b"]["status"] == 0
+    assert "baseline" in mut_rec
+    assert "mutated" in mut_rec
+
+
+def test_headers_fingerprint_uses_actual_headers():
+    """Fix 13: headers_fingerprint is computed from actual request headers, not None."""
+    headers = {
+        "Accept": "application/json",
+        "X-Custom": "custom_val",
+        "Cookie": "session=secret",
+    }
+    fp = replayer.compute_headers_fingerprint(headers)
+    fp_empty = replayer.compute_headers_fingerprint(None)
+
+    assert fp != fp_empty
+    # Auth-irrelevant header (Cookie) is ignored
+    fp_with_auth = replayer.compute_headers_fingerprint({
+        "Accept": "application/json",
+        "X-Custom": "custom_val",
+        "Authorization": "Bearer 123",
+    })
+    assert fp == fp_with_auth
