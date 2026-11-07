@@ -32,6 +32,14 @@ API_EXTENSIONS = {
 }
 DEFAULT_MAX_BODY_BYTES = 64 * 1024
 DEFAULT_CHECKPOINT_INTERVAL = 25
+SENSITIVE_REQUEST_HEADERS = {
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+    "x-csrf-token",
+    "x-xsrf-token",
+}
 
 
 def _normalize_host(value: str) -> str:
@@ -311,6 +319,20 @@ class CaptureLogger:
                 truncated,
             )
 
+    @staticmethod
+    def _redacted_request_headers(headers) -> dict[str, str]:
+        redacted: dict[str, str] = {}
+        for name, value in headers.items():
+            header_name = str(name)
+            lower_name = header_name.lower()
+            redacted[header_name] = (
+                "******"
+                if lower_name in SENSITIVE_REQUEST_HEADERS
+                or "token" in lower_name
+                else str(value)
+            )
+        return redacted
+
     def _build_record(self, flow: http.HTTPFlow, event: str) -> dict:
         request = flow.request
         response = flow.response
@@ -321,6 +343,9 @@ class CaptureLogger:
             "method": request.method,
             "url": request.pretty_url,
             "status_code": response.status_code if response else None,
+            "request_headers_redacted": self._redacted_request_headers(
+                request.headers
+            ),
             "request_content_type": request.headers.get("content-type", ""),
             "response_content_type": (
                 response.headers.get("content-type", "") if response else ""
