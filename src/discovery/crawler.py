@@ -142,13 +142,20 @@ def is_auth_state_valid(metadata_path: Path, origin: str, now: datetime) -> bool
         return False
 
 
-def prepare_auth_state(start_url: str) -> Tuple[Path, Path, str]:
+def prepare_auth_state(
+    start_url: str,
+    state_override: Path | None = None,
+) -> Tuple[Path, Path, str]:
     """Selects a target-specific state file and removes invalid saved state."""
     origin = get_origin(start_url)
     if not origin:
         raise ValueError("The starting URL must include a valid HTTP or HTTPS origin")
 
-    state_path, metadata_path = get_auth_state_paths(origin)
+    if state_override is None:
+        state_path, metadata_path = get_auth_state_paths(origin)
+    else:
+        state_path = state_override
+        metadata_path = state_path.with_name(f"{state_path.stem}.metadata.json")
     state_is_valid = (
         state_path.is_file()
         and metadata_path.is_file()
@@ -164,25 +171,6 @@ def prepare_auth_state(start_url: str) -> Tuple[Path, Path, str]:
                 raise OSError(f"Could not remove invalid authentication file {path}") from exc
     state_path.parent.mkdir(parents=True, exist_ok=True)
     return state_path, metadata_path, origin
-
-
-def write_auth_metadata(metadata_path: Path, origin: str) -> None:
-    """Writes metadata after a successful login using an atomic replacement."""
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
-    metadata = {
-        "origin": origin,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        temporary_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        temporary_path.replace(metadata_path)
-    except OSError:
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
 
 
 def discard_auth_state(state_path: Path, metadata_path: Path) -> None:
@@ -218,12 +206,12 @@ async def is_login_page(page: Page) -> bool:
 
 
 async def create_context(browser: Browser, proxy_settings: Dict[str, str] | None,
-                         state_path: Path) -> BrowserContext:
+                         state_path: Path | None) -> BrowserContext:
     """Creates a browser context with an optional validated state file."""
     context_args: Dict[str, object] = {}
     if proxy_settings:
         context_args["proxy"] = proxy_settings
-    if state_path.exists():
+    if state_path is not None and state_path.exists():
         context_args["storage_state"] = str(state_path)
     return await browser.new_context(**context_args)
 
@@ -405,11 +393,29 @@ def should_skip(url: str, scope: str, visited_keys: Set[str]) -> bool:
         
     return False
 
-async def crawl(start_url: str, scope: str, max_pages: int, max_depth: int, headful: bool, delay: float) -> None:
+async def crawl(
+    start_url: str,
+    scope: str,
+    max_pages: int,
+    max_depth: int,
+    headful: bool,
+    delay: float,
+    login_required: bool = True,
+) -> None:
     """
     Executes the BFS crawl loop using Playwright.
     """
-    state_path, metadata_path, origin = prepare_auth_state(start_url)
+    if login_required:
+        configured_state = os.getenv("VICTIM_AUTH_STATE_PATH")
+        state_override = Path(configured_state).expanduser() if configured_state else None
+        if state_override is not None and not state_override.is_absolute():
+            state_override = auth.ROOT / state_override
+        state_path, metadata_path, origin = prepare_auth_state(start_url, state_override)
+    else:
+        state_path = metadata_path = None
+        origin = get_origin(start_url)
+        if not origin:
+            raise ValueError("The starting URL must include a valid HTTP or HTTPS origin")
     crawl_output_dir = get_crawl_output_dir(origin)
     crawl_output_dir.mkdir(parents=True, exist_ok=False)
     urls_path = crawl_output_dir / "urls.txt"
@@ -473,40 +479,46 @@ async def crawl(start_url: str, scope: str, max_pages: int, max_depth: int, head
 
             context = await create_context(browser, proxy_settings, state_path)
 
-            if state_path.exists():
-                validation_page = await context.new_page()
-                try:
-                    await validation_page.goto(
-                        normalized_start,
-                        wait_until="domcontentloaded",
-                        timeout=15000,
-                    )
-                    session_is_valid = not await is_login_page(validation_page)
-                finally:
-                    await validation_page.close()
+            if login_required:
+                assert state_path is not None and metadata_path is not None
+                if state_path.exists():
+                    validation_page = await context.new_page()
+                    try:
+                        await validation_page.goto(
+                            normalized_start,
+                            wait_until="domcontentloaded",
+                            timeout=15000,
+                        )
+                        session_is_valid = not await is_login_page(validation_page)
+                    finally:
+                        await validation_page.close()
 
-                if not session_is_valid:
-                    logging.info("Saved authentication session was rejected; logging in again")
-                    await context.close()
-                    discard_auth_state(state_path, metadata_path)
-                    context = await create_context(browser, proxy_settings, state_path)
+                    if not session_is_valid:
+                        logging.info("Saved authentication session was rejected; logging in again")
+                        await context.close()
+                        discard_auth_state(state_path, metadata_path)
+                        context = await create_context(browser, proxy_settings, state_path)
 
-            if not state_path.exists():
-                login_page = await context.new_page()
-                try:
-                    await auth.login_if_needed(
-                        login_page,
-                        state_path=state_path,
-                        errors_path=errors_path,
-                    )
-                finally:
-                    await login_page.close()
-                if not state_path.is_file():
-                    raise RuntimeError(
-                        "Authentication did not create a valid state file; "
-                        "check the crawl errors.log"
-                    )
-                write_auth_metadata(metadata_path, origin)
+                if not state_path.exists():
+                    login_page = await context.new_page()
+                    try:
+                        login_succeeded = await auth.login_if_needed(
+                            login_page,
+                            state_path=state_path,
+                            errors_path=errors_path,
+                            identity="victim",
+                            target_origin=origin,
+                        )
+                    finally:
+                        await login_page.close()
+                    if not login_succeeded or not state_path.is_file():
+                        raise RuntimeError(
+                            "Authentication did not create a valid state file; "
+                            "check the crawl errors.log"
+                        )
+                    auth.write_auth_metadata(metadata_path, origin)
+            else:
+                logging.info("Login verification skipped; crawling without authentication")
 
             while queue and pages_visited < max_pages:
                 url, depth = queue.popleft()
@@ -807,11 +819,18 @@ def main() -> None:
     env_max_pages = int(os.getenv("MAX_PAGES", 500))
     env_max_depth = int(os.getenv("MAX_DEPTH", 5))
     env_delay = float(os.getenv("DELAY_SECONDS", 1.0))
+    env_no_login = os.getenv("NO_LOGIN", "").strip().lower() in {"1", "true", "yes"}
     
     parser.add_argument("--max-pages", type=int, default=env_max_pages, help="Max pages to visit")
     parser.add_argument("--max-depth", type=int, default=env_max_depth, help="Max link depth")
     parser.add_argument("--headful", action="store_true", help="Show browser window")
     parser.add_argument("--delay", type=float, default=env_delay, help="Seconds between page visits")
+    parser.add_argument(
+        "--no-login",
+        action="store_true",
+        default=env_no_login,
+        help="Skip authentication state validation and login; crawl public pages directly",
+    )
     
     args = parser.parse_args()
     
@@ -825,7 +844,8 @@ def main() -> None:
         max_pages=args.max_pages,
         max_depth=args.max_depth,
         headful=args.headful,
-        delay=args.delay
+        delay=args.delay,
+        login_required=not args.no_login,
     ))
 
 if __name__ == "__main__":
