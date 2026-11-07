@@ -22,6 +22,7 @@ from typing import Any, Optional
 # ---------------------------------------------------------------------------
 
 ALLOWED_CONTENT_TYPES = {"application/json", "text/html", "text/plain"}
+ALLOWED_TEST_KINDS = {"credential_swap", "identifier_mutation"}
 
 # replay_error values that indicate baseline/invalid state - these must be
 # treated as INCONCLUSIVE (baseline failure is not evidence of auth enforced).
@@ -68,6 +69,20 @@ class StageCInputError(ValueError):
     Stage B schema. Carries the offending candidate_id so a mismatch between
     Daniel's real output and the documented contract is loud and actionable
     instead of a bare KeyError/TypeError during integration."""
+
+
+def normalize_content_type(content_type: Any) -> str | None:
+    """Return the media type without parameters, or None when absent."""
+    if not isinstance(content_type, str):
+        return None
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    return media_type or None
+
+
+def is_supported_content_type(content_type: Any) -> bool:
+    """Allow missing metadata; reject explicitly unsupported media types."""
+    normalized = normalize_content_type(content_type)
+    return normalized is None or normalized in ALLOWED_CONTENT_TYPES
 
 
 def classify_all(replay_results: dict) -> list[dict]:
@@ -143,6 +158,11 @@ def classify_record(record: dict) -> dict:
         )
     replay_error = record.get("replay_error")
     test_kind = record.get("test_kind", "credential_swap")
+    if not isinstance(test_kind, str) or test_kind not in ALLOWED_TEST_KINDS:
+        raise StageCInputError(
+            f"candidate_id={candidate_id}: test_kind must be one of "
+            f"{sorted(ALLOWED_TEST_KINDS)}, got {test_kind!r}"
+        )
 
     classification, rule_fired = _classify(
         session_a, session_b, delta, flags, replay_error, test_kind
@@ -218,7 +238,7 @@ def _classify(
 
     # 2. Binary / unexpected content -> don't classify.
     for ct in (a_ct, b_ct):
-        if ct not in ALLOWED_CONTENT_TYPES:
+        if not is_supported_content_type(ct):
             return "INCONCLUSIVE", RULE_UNEXPECTED_CONTENT_TYPE
 
     # Baseline/invalid replay state must be INCONCLUSIVE (not treated as evidence of auth enforced)
@@ -231,9 +251,9 @@ def _classify(
         return "NOT_VULNERABLE", RULE_ATTACKER_DENIED
 
     if test_kind == "credential_swap" and body_identical and not status_changed:
-        # Suspicious but not conclusive by itself - surfaced separately in
-        # the report's "Manual review" section by report.py.
-        return "NOT_VULNERABLE", RULE_BODY_IDENTICAL
+        # Identical bodies do not prove authorization was enforced. Keep this
+        # as an explicit manual-review signal instead of a safe conclusion.
+        return "INCONCLUSIVE", RULE_BODY_IDENTICAL
 
     if status_changed and not got_owner_object:
         return "INCONCLUSIVE", RULE_IDENTIFIER_IGNORED
@@ -282,13 +302,17 @@ def assign_confidence(session_a: dict, session_b: dict, delta: dict) -> str:
 
     if (
         b_status == 200
-        and a_ct == "application/json"
-        and b_ct == "application/json"
+        and normalize_content_type(a_ct) == "application/json"
+        and normalize_content_type(b_ct) == "application/json"
         and size_delta > 50
     ):
         return "high"
 
-    if b_status in (200, 206) and a_ct == b_ct and size_delta > 5:
+    if (
+        b_status in (200, 206)
+        and normalize_content_type(a_ct) == normalize_content_type(b_ct)
+        and size_delta > 5
+    ):
         return "medium"
 
     return "low"
