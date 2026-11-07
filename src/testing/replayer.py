@@ -31,12 +31,20 @@ import logging
 import os
 import re
 import tempfile
-import uuid
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 
 import httpx
+
+from src.discovery import auth
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +71,7 @@ DESTRUCTIVE_PATH_PATTERNS = (
 MAX_REQUESTS_PER_CANDIDATE = 4
 DEFAULT_MAX_RETRIES = 3
 INITIAL_BACKOFF_SECONDS = 2.0
+DEFAULT_IDENTITY_PATHS = ("/me", "/api/me", "/user", "/api/user", "/profile")
 
 AUTH_IRRELEVANT_HEADERS = {
     "cookie",
@@ -116,6 +125,18 @@ class RequestIdentityError(RuntimeError):
     """Raised when replay request differs from baseline in non-auth aspects."""
 
 
+class PreflightAuthenticationError(RuntimeError):
+    """Raised when the preflight probe does not authenticate both sessions."""
+
+
+class InvalidRequestBodyError(ValueError):
+    """Raised when a captured request body cannot be decoded as declared."""
+
+
+class CandidateInputError(ValueError):
+    """Raised when a replay candidate is missing required identity metadata."""
+
+
 # ---------------------------------------------------------------------------
 # Scope & URL Safety Checks
 # ---------------------------------------------------------------------------
@@ -135,6 +156,8 @@ def check_scope(url: str, scope_domain: Optional[str] = None) -> bool:
         return False
 
     scope = scope.strip().lower()
+    if "://" in scope:
+        scope = urlparse(scope).hostname or ""
     return host == scope or host.endswith("." + scope)
 
 
@@ -324,14 +347,23 @@ def extract_candidate_body(candidate: dict[str, Any]) -> tuple[bytes, bool]:
     Extract request body bytes and presence flag from candidate.
     Handles raw bytes, utf-8 strings, and base64 encodings.
     """
-    present = candidate.get("request_body_present", False)
+    request = candidate.get("request")
+    request = request if isinstance(request, dict) else {}
+    present = request.get(
+        "body_present",
+        candidate.get("request_body_present", False),
+    )
     raw_body = (
-        candidate.get("request_body")
+        request.get("body")
+        or candidate.get("request_body")
         or candidate.get("body")
         or candidate.get("content")
         or b""
     )
-    encoding = candidate.get("request_body_encoding", "utf-8")
+    encoding = request.get(
+        "body_encoding",
+        candidate.get("request_body_encoding", "utf-8"),
+    )
 
     if not raw_body:
         return b"", bool(present)
@@ -341,11 +373,13 @@ def extract_candidate_body(candidate: dict[str, Any]) -> tuple[bytes, bool]:
 
     if isinstance(raw_body, str):
         if encoding == "base64":
+            import base64
             try:
-                import base64
-                return base64.b64decode(raw_body), True
-            except Exception:
-                return raw_body.encode("utf-8"), True
+                return base64.b64decode(raw_body, validate=True), True
+            except (ValueError, TypeError) as exc:
+                raise InvalidRequestBodyError(
+                    "Captured request body is not valid base64."
+                ) from exc
         return raw_body.encode("utf-8"), True
 
     return b"", bool(present)
@@ -371,32 +405,39 @@ def mutate_identifier_value(orig_val: str, value_type: Optional[str] = None) -> 
     return f"{orig_str}2"
 
 
-def mutate_query_param(url: str, param_name: str, orig_val: str, mutated_val: str) -> str:
+def mutate_query_param(
+    url: str,
+    param_name: str,
+    orig_val: str,
+    mutated_val: str,
+    occurrence: Optional[int] = None,
+) -> str:
     """
     Replace exactly one occurrence of param_name in the query string.
+
+    ``occurrence`` is the zero-based occurrence recorded by the candidate
+    selector. When omitted, the first matching value is retained for legacy
+    candidates.
     """
     parsed_u = urlparse(url)
     q_list = parse_qsl(parsed_u.query, keep_blank_values=True)
+    target_occurrence = 0 if occurrence is None else occurrence
+    if target_occurrence < 0:
+        return url
+    matching_occurrence = 0
     replaced = False
     new_q = []
     for k, v in q_list:
         if k == param_name and not replaced:
-            if orig_val and v == orig_val:
-                new_q.append((k, mutated_val))
-                replaced = True
-            elif not orig_val:
+            is_target = matching_occurrence == target_occurrence
+            matching_occurrence += 1
+            if is_target and (not orig_val or v == orig_val):
                 new_q.append((k, mutated_val))
                 replaced = True
             else:
                 new_q.append((k, v))
         else:
             new_q.append((k, v))
-    if not replaced:
-        for i, (k, v) in enumerate(new_q):
-            if k == param_name:
-                new_q[i] = (k, mutated_val)
-                replaced = True
-                break
     return parsed_u._replace(query=urlencode(new_q)).geturl()
 
 
@@ -416,6 +457,70 @@ def mutate_path_segment(url: str, orig_val: str, mutated_val: str) -> str:
             new_segments.append(s)
     mutated_path = "/".join(new_segments)
     return parsed_u._replace(path=mutated_path).geturl()
+
+
+def mutate_header_value(
+    headers: dict[str, str],
+    name: str,
+    orig_val: str,
+    mutated_val: str,
+) -> dict[str, str] | None:
+    """Return headers with exactly one selected identifier header mutated."""
+    mutated_headers = dict(headers)
+    header_name = next((key for key in headers if key.lower() == name.lower()), None)
+    if header_name is None:
+        return None
+    current_value = headers[header_name]
+    if orig_val and current_value != orig_val:
+        return None
+    mutated_headers[header_name] = mutated_val
+    return mutated_headers
+
+
+def mutate_body_identifier(
+    body: bytes,
+    encoding: str,
+    name: str,
+    orig_val: str,
+    mutated_val: str,
+) -> tuple[bytes, str] | None:
+    """Mutate one top-level or one-level-nested JSON identifier field."""
+    import base64
+
+    try:
+        if encoding == "base64":
+            decoded = base64.b64decode(body, validate=True).decode("utf-8")
+        else:
+            decoded = body.decode("utf-8")
+        payload = json.loads(decoded)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+    def replace_in_mapping(mapping: dict[str, Any]) -> bool:
+        value = mapping.get(name)
+        if value is not None and str(value) == orig_val:
+            mapping[name] = (
+                int(mutated_val)
+                if isinstance(value, int) and not isinstance(value, bool)
+                and mutated_val.isdigit()
+                else mutated_val
+            )
+            return True
+        return False
+
+    replaced = isinstance(payload, dict) and replace_in_mapping(payload)
+    if not replaced and isinstance(payload, dict):
+        for value in payload.values():
+            if isinstance(value, dict) and replace_in_mapping(value):
+                replaced = True
+                break
+    if not replaced:
+        return None
+
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    if encoding == "base64":
+        return base64.b64encode(encoded), encoding
+    return encoded, "utf-8"
 
 
 def build_http_client(
@@ -459,6 +564,26 @@ def build_http_client(
                 else:
                     headers["authorization"] = f"Bearer {token}"
 
+    # Restore raw localStorage tokens for the in-memory client. They are never
+    # written to replay output or logs.
+    for origin in auth_data.get("origins", []):
+        for item in origin.get("localStorage", []):
+            token = _extract_token_from_storage_value(item.get("value", ""))
+            if token and (
+                "token" in item.get("name", "").lower()
+                or "auth" in item.get("name", "").lower()
+                or "jwt" in item.get("name", "").lower()
+                or "bearer" in item.get("name", "").lower()
+                or token.lower().startswith("bearer ")
+                or _JWT_PATTERN.search(token)
+            ):
+                headers["authorization"] = (
+                    token
+                    if token.lower().startswith("bearer ")
+                    else f"Bearer {token}"
+                )
+                break
+
     # Explicit headers in auth state
     if "headers" in auth_data and isinstance(auth_data["headers"], dict):
         for k, v in auth_data["headers"].items():
@@ -473,6 +598,7 @@ def build_http_client(
         cookies=cookies,
         headers=headers,
         follow_redirects=False,
+        trust_env=False,
         timeout=timeout,
     )
 
@@ -487,9 +613,9 @@ async def run_preflight_check(
     probe_url: str,
 ) -> dict[str, Any]:
     """
-    Verify Session A and Session B are DIFFERENT accounts before any testing.
-    Hits a who-am-i endpoint (like /me). If body_identical, aborts with
-    SameAccountError("attacker_and_owner_are_same_account").
+    Verify both sessions authenticate and are DIFFERENT accounts before testing.
+    Hits a who-am-i endpoint (like /me). If either response is not successful,
+    aborts rather than treating different error pages as distinct accounts.
     """
     try:
         resp_a = await client_a.get(probe_url)
@@ -497,6 +623,13 @@ async def run_preflight_check(
     except Exception as exc:
         logger.warning("Preflight request failed: %s", exc)
         raise RuntimeError(f"Preflight request failed on {probe_url}: {exc}") from exc
+
+    if not (200 <= resp_a.status_code < 300) or not (200 <= resp_b.status_code < 300):
+        raise PreflightAuthenticationError(
+            "Preflight authentication failed: "
+            f"owner_status={resp_a.status_code}, "
+            f"attacker_status={resp_b.status_code}"
+        )
 
     hash_a = hashlib.sha256(resp_a.content).hexdigest()
     hash_b = hashlib.sha256(resp_b.content).hexdigest()
@@ -510,6 +643,42 @@ async def run_preflight_check(
         "owner_status": resp_a.status_code,
         "attacker_status": resp_b.status_code,
     }
+
+
+async def find_identity_probe(
+    client_a: httpx.AsyncClient,
+    client_b: httpx.AsyncClient,
+    first_candidate_url: str,
+    scope_domain: Optional[str],
+    explicit_url: Optional[str] = None,
+) -> dict[str, Any]:
+    """Find a configured or conventional identity endpoint and verify distinct sessions."""
+    configured = explicit_url or os.environ.get("IDENTITY_URL") or os.environ.get("PREFLIGHT_URL")
+    configured_paths = [configured] if configured else []
+    configured_paths.extend(
+        path.strip()
+        for path in os.environ.get("IDENTITY_URLS", ",".join(DEFAULT_IDENTITY_PATHS)).split(",")
+        if path.strip()
+    )
+    if first_candidate_url:
+        base = first_candidate_url
+    else:
+        effective_scope = scope_domain or os.environ.get("SCOPE_DOMAIN", "")
+        base = effective_scope.strip().rstrip("/")
+        if base and "://" not in base:
+            base = f"http://{base}"
+    for candidate in configured_paths:
+        probe = candidate if candidate.startswith(("http://", "https://")) else urljoin(base, candidate)
+        if not check_scope(probe, scope_domain):
+            continue
+        try:
+            return await run_preflight_check(client_a, client_b, probe)
+        except (PreflightAuthenticationError, SameAccountError, RuntimeError):
+            continue
+    raise PreflightAuthenticationError(
+        "Could not verify two distinct authenticated accounts; "
+        "configure IDENTITY_URL or IDENTITY_URLS for the target"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -585,7 +754,11 @@ async def replay_single_candidate(
     Returns a list containing the primary 'credential_swap' record and an optional
     'identifier_mutation' corroborating record.
     """
-    candidate_id = candidate.get("candidate_id", str(uuid.uuid4()))
+    candidate_id = candidate.get("candidate_id")
+    if not isinstance(candidate_id, str) or not candidate_id.strip():
+        raise CandidateInputError(
+            "Replay candidate is missing a non-empty candidate_id."
+        )
     source_url = candidate.get("source_url", "")
     method = candidate.get("method", "GET").upper()
     baseline_status = candidate.get("baseline_status", 200)
@@ -603,11 +776,18 @@ async def replay_single_candidate(
 
     # Extract captured body, headers, and metadata (Fixes Issue 3)
     req_body, body_present = extract_candidate_body(candidate)
-    replay_headers = prepare_replay_headers(candidate.get("headers"))
+    request_metadata = candidate.get("request")
+    request_metadata = request_metadata if isinstance(request_metadata, dict) else {}
+    captured_headers = request_metadata.get("headers_redacted")
+    if not isinstance(captured_headers, dict):
+        captured_headers = candidate.get("headers")
+    replay_headers = prepare_replay_headers(captured_headers)
     if body_present and "content-type" not in replay_headers:
-        ct = candidate.get("request_content_type")
+        ct = request_metadata.get("content_type") or candidate.get("request_content_type")
         if ct:
             replay_headers["content-type"] = str(ct)
+    body_valid = request_metadata.get("body_valid")
+    body_validation_error = request_metadata.get("body_validation_error")
 
     # Rate limiting delay
     is_list = is_list_endpoint(source_url, candidate.get("notes"))
@@ -687,6 +867,10 @@ async def replay_single_candidate(
                     "params_hash": compute_params_hash(source_url, req_body),
                     "headers_fingerprint": compute_headers_fingerprint(replay_headers),
                     "body_present": bool(body_present or req_body),
+                    "content_type": request_metadata.get("content_type")
+                    or candidate.get("request_content_type"),
+                    "body_valid": body_valid,
+                    "body_validation_error": body_validation_error,
                     "identifier": candidate.get("identifier"),
                 },
                 "session_a": session_a_dict,
@@ -814,7 +998,12 @@ async def replay_single_candidate(
     # 9. Step 9: Identifier mutation within owner session (secondary signal)
     # Supports integer, string, and file selectors (Fixes Issue 2)
     ident = candidate.get("identifier")
-    if ident and isinstance(ident, dict) and ident.get("location") in ("query", "path"):
+    if ident and isinstance(ident, dict) and ident.get("location") in (
+        "query",
+        "path",
+        "header",
+        "body",
+    ):
         orig_val = str(ident.get("original_value", "1"))
         v_type = ident.get("value_type")
         mutated_val = mutate_identifier_value(orig_val, v_type)
@@ -822,10 +1011,50 @@ async def replay_single_candidate(
         mutated_url = source_url
         if ident.get("location") == "query" and ident.get("name"):
             # Replace exactly one query parameter (Fixes Issue 8)
-            mutated_url = mutate_query_param(source_url, ident["name"], orig_val, mutated_val)
+            mutated_url = mutate_query_param(
+                source_url,
+                ident["name"],
+                orig_val,
+                mutated_val,
+                ident.get("occurrence"),
+            )
         elif ident.get("location") == "path":
             # Replace exactly one path segment (Fixes Issue 7)
             mutated_url = mutate_path_segment(source_url, orig_val, mutated_val)
+
+        mutation_headers = replay_headers
+        mutation_body = req_body
+        mutation_body_present = body_present
+        mut_err: Optional[str] = None
+        if ident.get("location") == "header" and ident.get("name"):
+            mutation_headers = mutate_header_value(
+                replay_headers,
+                ident["name"],
+                orig_val,
+                mutated_val,
+            )
+            if mutation_headers is None:
+                mut_err = "header_identifier_not_replayable"
+        elif ident.get("location") == "body" and ident.get("name"):
+            mutated_body = mutate_body_identifier(
+                req_body,
+                (
+                    candidate.get("request", {}).get("body_encoding", "utf-8")
+                    if isinstance(candidate.get("request"), dict)
+                    else "utf-8"
+                ),
+                ident["name"],
+                orig_val,
+                mutated_val,
+            )
+            if mutated_body is None:
+                mut_err = "body_identifier_not_replayable"
+            else:
+                mutation_body, _ = mutated_body
+        elif ident.get("location") in ("query", "path"):
+            pass
+        else:
+            mut_err = "unsupported_identifier_location"
 
         # Mutated URL safety guards check (Fixes Issue 6)
         parsed_mut = urlparse(mutated_url)
@@ -846,6 +1075,8 @@ async def replay_single_candidate(
         elif mut_safety_error:
             mut_err = mut_safety_error
             resp_mut = None
+        elif mut_err is not None:
+            resp_mut = None
         else:
             if delay > 0:
                 await asyncio.sleep(delay)
@@ -853,8 +1084,8 @@ async def replay_single_candidate(
                 client=client_a,
                 method=method,
                 url=mutated_url,
-                headers=replay_headers,
-                content=req_body if body_present else None,
+                headers=mutation_headers,
+                content=mutation_body if mutation_body_present else None,
             )
             total_requests += reqs_mut
             if total_requests > MAX_REQUESTS_PER_CANDIDATE:
@@ -978,30 +1209,22 @@ async def replay_all_candidates(
 
     # 2. Build clients
     async with build_http_client(auth_a_data) as client_a, build_http_client(auth_b_data) as client_b:
-        # Determine probe URL for preflight
-        probe = preflight_url or os.environ.get("PREFLIGHT_URL")
-        if not probe:
-            # Derive base from first candidate if available
-            if candidates:
-                first_url = candidates[0].get("source_url", "")
-                parsed = urlparse(first_url)
-                probe = f"{parsed.scheme}://{parsed.netloc}/me"
-            else:
-                effective_scope = (scope_domain or os.environ.get("SCOPE_DOMAIN", "")).strip().lower()
-                probe = f"http://{effective_scope}/me" if effective_scope else "/me"
-        elif probe.startswith("/"):
-            if candidates:
-                first_url = candidates[0].get("source_url", "")
-                probe = urljoin(first_url, probe)
-            else:
-                effective_scope = (scope_domain or os.environ.get("SCOPE_DOMAIN", "")).strip().lower()
-                probe = f"http://{effective_scope}{probe}" if effective_scope else probe
-
-        # 3. Check probe scope before sending credentials (Safety Guard) (Fixes Issue 5)
-        if not check_scope(probe, scope_domain):
-            raise ScopeViolationError(f"Preflight URL '{probe}' is outside SCOPE_DOMAIN.")
-
-        preflight_info = await run_preflight_check(client_a, client_b, probe)
+        # 3. Find a generic or configured identity endpoint before replay.
+        first_url = candidates[0].get("source_url", "") if candidates else ""
+        if preflight_url and not check_scope(
+            preflight_url if not preflight_url.startswith("/") else urljoin(first_url, preflight_url),
+            scope_domain,
+        ):
+            raise ScopeViolationError(
+                f"Preflight URL '{preflight_url}' is outside SCOPE_DOMAIN."
+            )
+        preflight_info = await find_identity_probe(
+            client_a,
+            client_b,
+            first_url,
+            scope_domain,
+            explicit_url=preflight_url,
+        )
 
         # 4. Replay candidates
         all_results: list[dict[str, Any]] = []
@@ -1052,15 +1275,43 @@ def run_stage_b(
 
     with open(candidates_path, "r", encoding="utf-8") as f:
         candidates = json.load(f)
+    if not isinstance(candidates, list):
+        raise CandidateInputError(
+            "candidates.json must contain a list of candidate dictionaries."
+        )
+    invalid_indexes = [
+        index for index, candidate in enumerate(candidates)
+        if not isinstance(candidate, dict)
+    ]
+    if invalid_indexes:
+        raise CandidateInputError(
+            "candidates.json contains non-dictionary candidates at indexes: "
+            + ", ".join(str(index) for index in invalid_indexes)
+        )
 
     # Resolve auth state paths
     root_dir = Path(__file__).resolve().parents[2]
-    auth_a = auth_state_path or os.environ.get("AUTH_STATE_PATH") or str(root_dir / "auth_state.json")
+    auth_a = (
+        auth_state_path
+        or os.environ.get("AUTH_STATE_PATH")
+        or os.environ.get("VICTIM_AUTH_STATE_PATH")
+        or str(root_dir / "auth_state.json")
+    )
     auth_b = (
         attacker_state_path
         or os.environ.get("ATTACKER_STATE_PATH")
+        or os.environ.get("ATTACKER_AUTH_STATE_PATH")
         or str(root_dir / "auth_state_attacker.json")
     )
+
+    attacker_path = Path(auth_b)
+    if not attacker_path.is_file() and os.getenv("ATTACKER_USERNAME") and os.getenv("ATTACKER_PASSWORD"):
+        scope = os.environ.get("SCOPE_DOMAIN", "")
+        target_origin = scope if scope.startswith(("http://", "https://")) else f"http://{scope}"
+        if not auth.refresh_auth_state("attacker", attacker_path, target_origin=target_origin):
+            raise MissingAuthStateError(
+                f"Attacker authentication could not create state file: {attacker_path}"
+            )
 
     data = asyncio.run(
         replay_all_candidates(
