@@ -108,10 +108,16 @@ def is_api_request(
     }
 
 
-def finalize_spool(output_file: Path) -> None:
+def finalize_spool(output_file: Path, remove_spool: bool = False) -> None:
     """Atomically finalize a JSONL spool into the public JSON array output."""
     output_file = Path(output_file)
     spool_file = output_file.with_name(f"{output_file.name}.records.jsonl")
+    if not spool_file.exists():
+        if output_file.exists():
+            return
+        output_file.write_text("[]\n", encoding="utf-8")
+        return
+
     temporary = output_file.with_suffix(".tmp")
     with temporary.open("w", encoding="utf-8") as output:
         output.write("[")
@@ -122,16 +128,21 @@ def finalize_spool(output_file: Path) -> None:
                     record = line.strip()
                     if not record:
                         continue
+                    try:
+                        parsed_record = json.loads(record)
+                    except json.JSONDecodeError:
+                        continue
                     if not first:
                         output.write(",")
-                    output.write(f"\n  {record}")
+                    output.write(f"\n  {json.dumps(parsed_record, separators=(',', ':'))}")
                     first = False
         output.write("\n]\n")
     temporary.replace(output_file)
-    try:
-        spool_file.unlink()
-    except FileNotFoundError:
-        pass
+    if remove_spool:
+        try:
+            spool_file.unlink()
+        except FileNotFoundError:
+            pass
 
 
 class CaptureLogger:
@@ -374,11 +385,11 @@ class CaptureLogger:
 
     def done(self):
         """Persist the complete capture once mitmproxy has finished."""
-        self._save()
+        self._save(remove_spool=True)
 
-    def _save(self):
+    def _save(self, remove_spool: bool = False):
         try:
-            finalize_spool(self.output_file)
+            finalize_spool(self.output_file, remove_spool=remove_spool)
         except Exception as exc:
             self._log_error(f"Save error: {exc}")
 

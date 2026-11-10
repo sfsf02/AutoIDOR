@@ -142,7 +142,6 @@ async def start_proxy(
     capture_dir = Path(capture_dir)
     capture_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_capture = capture_dir / "raw_flows.mitm"
     api_capture = capture_dir / "api_flows.json"
     error_capture = capture_dir / "proxy_errors.log"
 
@@ -162,8 +161,6 @@ async def start_proxy(
         str(port),
         "-s",
         str(ADDON),
-        "--save-stream-file",
-        str(raw_capture),
     ]
 
     env = os.environ.copy()

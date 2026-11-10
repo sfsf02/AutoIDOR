@@ -247,18 +247,11 @@ def _classify(
         return "INCONCLUSIVE", rule
 
     # 3. NOT_VULNERABLE
-    if denied:
+    if test_kind == "credential_swap" and denied:
         return "NOT_VULNERABLE", RULE_ATTACKER_DENIED
 
-    if test_kind == "credential_swap" and body_identical and not status_changed:
-        # Identical bodies do not prove authorization was enforced. Keep this
-        # as an explicit manual-review signal instead of a safe conclusion.
-        return "INCONCLUSIVE", RULE_BODY_IDENTICAL
-
-    if status_changed and not got_owner_object:
-        return "INCONCLUSIVE", RULE_IDENTIFIER_IGNORED
-
-    # 4. POSSIBLE_IDOR - all conditions must hold.
+    # 4. POSSIBLE_IDOR requires evidence that both JSON responses identify the
+    # exact object requested by the victim, not merely a successful response.
     if (
         test_kind == "credential_swap"
         and got_owner_object
@@ -267,6 +260,12 @@ def _classify(
         and replay_error is None
     ):
         return "POSSIBLE_IDOR", RULE_ATTACKER_GOT_OWNER_OBJECT
+
+    if test_kind == "credential_swap" and body_identical and not status_changed:
+        return "INCONCLUSIVE", RULE_BODY_IDENTICAL
+
+    if status_changed and not got_owner_object:
+        return "INCONCLUSIVE", RULE_IDENTIFIER_IGNORED
 
     # 5. Remaining INCONCLUSIVE conditions.
     if "no_control_found" in flags:
