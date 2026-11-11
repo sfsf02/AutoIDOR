@@ -126,18 +126,19 @@ def _escape_md(text: str) -> str:
 
 def generate_report(results: list[dict], preflight: dict) -> str:
     """Build the full phase2_report.md text from classified results."""
-    possible_idor = [r for r in results if r["classification"] == "POSSIBLE_IDOR"]
-    not_vulnerable = _sorted_by_id([r for r in results if r["classification"] == "NOT_VULNERABLE"])
-    inconclusive = _sorted_by_id([r for r in results if r["classification"] == "INCONCLUSIVE"])
+    primary_results = [r for r in results if r.get("test_kind") == "credential_swap"]
+    possible_idor = [r for r in primary_results if r["classification"] == "POSSIBLE_IDOR"]
+    not_vulnerable = _sorted_by_id([r for r in primary_results if r["classification"] == "NOT_VULNERABLE"])
+    inconclusive = _sorted_by_id([r for r in primary_results if r["classification"] == "INCONCLUSIVE"])
 
     high = [r for r in possible_idor if r.get("confidence") == "high"]
     med = [r for r in possible_idor if r.get("confidence") == "medium"]
     low = [r for r in possible_idor if r.get("confidence") == "low"]
 
-    findings_sorted = _sorted_findings(results)
+    findings_sorted = _sorted_findings(primary_results)
 
     manual_review = _sorted_by_id(
-        [r for r in results if r.get("rule_fired") == "body_identical_across_users"]
+        [r for r in primary_results if r.get("rule_fired") == "body_identical_across_users"]
     )
 
     identifier_mutation_rows = _sorted_by_id(
@@ -150,7 +151,7 @@ def generate_report(results: list[dict], preflight: dict) -> str:
     lines.append(f"# Phase 2 IDOR Report — {_timestamp()}")
     lines.append("")
     lines.append("## Summary")
-    lines.append(f"- Candidates tested: {len(results)}")
+    lines.append(f"- Candidates tested: {len(primary_results)}")
     lines.append(
         f"- POSSIBLE_IDOR: {len(possible_idor)} "
         f"(high: {len(high)} / med: {len(med)} / low: {len(low)})"
@@ -284,7 +285,7 @@ def generate_report(results: list[dict], preflight: dict) -> str:
         if "PII" not in report_text[:200]:
             report_text = report_text.replace(
                 "# Phase 2 IDOR Report",
-                "# Phase 2 IDOR Report\n\n⚠️ Some evidence was redacted to remove PII — review replay_results.json locally before sharing this report.",
+                "# Phase 2 IDOR Report\n\nWARNING: Some evidence was redacted to remove PII. Review replay_results.json locally before sharing this report.",
                 1,
             )
 

@@ -741,6 +741,40 @@ def is_list_endpoint(url: str, notes: Optional[str] = None) -> bool:
     return last_seg.endswith("s") and not re.search(r"\d", last_seg)
 
 
+def response_contains_identifier(
+    body: bytes,
+    content_type: str,
+    identifier: Any,
+) -> bool:
+    """Return true when a JSON response identifies the requested object."""
+    if not isinstance(identifier, dict) or content_type != "application/json":
+        return False
+    expected = str(identifier.get("original_value", ""))
+    if not expected:
+        return False
+    configured_name = identifier.get("name")
+    accepted_names = {"id"}
+    if isinstance(configured_name, str):
+        accepted_names.add(configured_name.lower())
+    try:
+        value = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+    def contains(node: Any) -> bool:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if str(key).lower() in accepted_names and str(child) == expected:
+                    return True
+                if contains(child):
+                    return True
+        elif isinstance(node, list):
+            return any(contains(child) for child in node)
+        return False
+
+    return contains(value)
+
+
 async def replay_single_candidate(
     candidate: dict[str, Any],
     client_a: httpx.AsyncClient,
@@ -944,8 +978,14 @@ async def replay_single_candidate(
     content_type_changed = a_ct != b_ct
     body_identical = a_sha == b_sha
     session_b_denied = b_status in (401, 403)
+    identifier = candidate.get("identifier")
+    owner_object_identified = response_contains_identifier(a_bytes, a_ct, identifier)
     session_b_got_owner_object = (
-        (b_status in (200, 201)) and (not body_identical) and (not session_b_denied)
+        a_status in (200, 201)
+        and b_status in (200, 201)
+        and owner_object_identified
+        and response_contains_identifier(b_bytes, b_ct, identifier)
+        and not session_b_denied
     )
     redirected_to_login = (b_status in (301, 302, 303)) and (
         "/login" in b_loc.lower() or "/signin" in b_loc.lower()

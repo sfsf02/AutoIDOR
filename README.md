@@ -191,6 +191,34 @@ URL mode requires two distinct authenticated accounts. `--no-login` is not
 accepted in the full `AutoIDOR.py` pipeline because an unauthenticated crawl
 cannot perform a meaningful victim-versus-attacker credential swap.
 
+The URL workflow always starts its managed capture proxy. `START_PROXY` is
+only needed when invoking the crawler directly.
+
+## Local presentation demo
+
+The repository includes a dependency-free training website with two accounts,
+one intentionally vulnerable API, and one correctly protected API. Run the
+complete demonstration from a single terminal:
+
+```text
+python demo/run_demo.py
+```
+
+Use `python demo/run_demo.py --headful` to show browser discovery during the
+presentation. The demo runner starts the target on `http://127.0.0.1:8000`,
+runs the full scanner, prints the generated report path, and stops the target.
+It does not read or modify `.env`.
+
+Expected result:
+
+- `/api/documents/101` is `POSSIBLE_IDOR` because Bob receives JSON identifying
+  Alice's requested document `101`.
+- `/api/secure-documents/101` is `NOT_VULNERABLE` because Bob receives `403`.
+- Preflight reports that Alice and Bob are distinct authenticated sessions.
+
+The demo credentials are intentionally public and must never be reused for a
+real application.
+
 ## Run a public crawl only
 
 For public endpoint discovery without login, run the crawler directly:
@@ -285,8 +313,10 @@ python -m src.testing.report "captures/http_example.test/<run-id>"
 
 ### `POSSIBLE_IDOR`
 
-The attacker received a successful, non-identical response for a credential
-swap. This is a lead requiring review, not automatic proof of a vulnerability.
+The attacker received a successful JSON response that contains the identifier
+of the exact object requested by the victim. This is a lead requiring review,
+not automatic proof of a vulnerability; public objects can produce the same
+signal.
 
 ### `NOT_VULNERABLE`
 
@@ -308,6 +338,7 @@ stronger response evidence than a small response-size difference.
 - Scope checks fail closed when `SCOPE_DOMAIN` is missing.
 - Destructive paths are blocked.
 - Authentication headers and cookies are not copied between identities.
+- Raw mitmproxy traffic files are not persisted by default.
 - Do not enable body capture unless it is necessary and authorized.
 - Do not commit `.env`, browser state, tokens, or generated sensitive output.
 

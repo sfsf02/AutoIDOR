@@ -242,7 +242,7 @@ def extract_query_identifier(query_string: str) -> dict | None:
             return {"location": "query", "name": name,
                     "original_value": value, "value_type": "filename",
                     "occurrence": occurrence}
-        if name not in IDENTIFIER_PARAM_ALLOWLIST:
+        if name.lower() not in IDENTIFIER_PARAM_ALLOWLIST:
             continue
         vtype = classify_value(value)
         if vtype in ("integer", "uuid", "filename"):
@@ -317,7 +317,7 @@ def request_body_validity(body, encoding: str | None = None) -> tuple[bool, str 
 
 
 def _body_value_to_ident(name, value):
-    if not isinstance(name, str) or name not in IDENTIFIER_PARAM_ALLOWLIST:
+    if not isinstance(name, str) or name.lower() not in IDENTIFIER_PARAM_ALLOWLIST:
         return None
     if isinstance(value, bool):
         return None
@@ -668,15 +668,15 @@ def select_candidates(
         if is_destructive_path(parsed.path):
             continue
 
-        # Priority: path > query > header > body
+        # Explicitly named identifiers are stronger than heuristic path slugs.
         identifier = (
-            extract_path_identifier(parsed.path)
-            or extract_query_identifier(parsed.query)
+            extract_query_identifier(parsed.query)
             or extract_header_identifier(flow.get("request_headers_redacted"))
             or extract_body_identifier(
                 flow.get("request_body"),
                 flow.get("request_body_encoding"),
             )
+            or extract_path_identifier(parsed.path)
         )
         if identifier is None:
             continue

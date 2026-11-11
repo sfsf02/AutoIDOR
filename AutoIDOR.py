@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -31,8 +32,6 @@ def configure_origin_auth_paths(origin: str) -> tuple[Path, Path]:
     victim = directory / "auth_state_victim.json"
     attacker = directory / "auth_state_attacker.json"
     # Child processes inherit these values, including crawler and replayer.
-    import os
-
     os.environ["VICTIM_AUTH_STATE_PATH"] = str(victim)
     os.environ["ATTACKER_AUTH_STATE_PATH"] = str(attacker)
     return victim, attacker
@@ -43,8 +42,6 @@ def configure_auth_paths_for_capture(run_dir: Path) -> tuple[Path, Path]:
     origin_dir = run_dir.parent
     victim = origin_dir / "auth_state_victim.json"
     attacker = origin_dir / "auth_state_attacker.json"
-    import os
-
     os.environ["VICTIM_AUTH_STATE_PATH"] = str(victim)
     os.environ["ATTACKER_AUTH_STATE_PATH"] = str(attacker)
     return victim, attacker
@@ -82,10 +79,10 @@ def run_discovery(url: str, no_login: bool, headful: bool) -> Path:
         raise ValueError("--url must be a complete HTTP or HTTPS URL")
     origin = f"{parsed.scheme}://{parsed.netloc}"
     victim_state, attacker_state = configure_origin_auth_paths(origin)
-    started_at = max(
-        (path.stat().st_mtime for path in (ROOT / "captures").rglob("*")),
-        default=0,
-    )
+    origin_dir = origin_directory(origin)
+    existing_runs = {path.resolve() for path in origin_dir.iterdir() if path.is_dir()}
+    os.environ["SCOPE_DOMAIN"] = origin
+    os.environ["START_PROXY"] = "true"
 
     if not no_login:
         print("\n[1/6] Creating victim authentication state...")
@@ -116,9 +113,9 @@ def run_discovery(url: str, no_login: bool, headful: bool) -> Path:
     run_command(command)
 
     capture_dirs = [
-        path for path in (ROOT / "captures").rglob("*")
+        path for path in origin_dir.iterdir()
         if path.is_dir()
-        and path.stat().st_mtime >= started_at
+        and path.resolve() not in existing_runs
         and (path / "discovered_endpoints.json").is_file()
         and (path / "api_flows.json").is_file()
     ]
@@ -128,29 +125,29 @@ def run_discovery(url: str, no_login: bool, headful: bool) -> Path:
 
 
 def select_candidates(run_dir: Path) -> None:
-    script = """
-from src.testing.candidate_selector import run
+    from src.testing.candidate_selector import run
 
-run_dir = r"{run_dir}"
-candidates = run(
-    discovered_path=run_dir + r"\\discovered_endpoints.json",
-    flows_path=run_dir + r"\\api_flows.json",
-    output_path=run_dir + r"\\candidates.json",
-    errors_log=run_dir + r"\\errors.log",
-)
-print(f"Selected candidates: {{len(candidates)}}")
-""".format(run_dir=str(run_dir))
-    run_command([sys.executable, "-c", script])
+    candidates = run(
+        discovered_path=str(run_dir / "discovered_endpoints.json"),
+        flows_path=str(run_dir / "api_flows.json"),
+        output_path=str(run_dir / "candidates.json"),
+        errors_log=str(run_dir / "errors.log"),
+    )
+    print(f"Selected candidates: {len(candidates)}")
 
 
 def summarize(run_dir: Path) -> None:
     replay = json.loads((run_dir / "replay_results.json").read_text(encoding="utf-8"))
     results = json.loads((run_dir / "phase2_results.json").read_text(encoding="utf-8"))
+    primary_results = [
+        result for result in results
+        if result.get("test_kind") == "credential_swap"
+    ]
 
     counts = {
         classification: sum(
             result.get("classification") == classification
-            for result in results
+            for result in primary_results
         )
         for classification in ("POSSIBLE_IDOR", "NOT_VULNERABLE", "INCONCLUSIVE")
     }
@@ -159,7 +156,8 @@ def summarize(run_dir: Path) -> None:
     print("\nAutoIDOR summary")
     print(f"Run directory: {run_dir}")
     print(f"Preflight sessions distinct: {replay['preflight'].get('sessions_distinct')}")
-    print(f"Replay records: {len(replay['results'])}")
+    print(f"Candidates tested: {len(primary_results)}")
+    print(f"Replay records (including mutation probes): {len(replay['results'])}")
     print(f"Replay errors: {replay_errors}")
     for classification, count in counts.items():
         print(f"{classification}: {count}")
@@ -251,6 +249,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (FileNotFoundError, RuntimeError) as error:
+    except (FileNotFoundError, RuntimeError, ValueError) as error:
         print(f"AutoIDOR failed: {error}", file=sys.stderr)
         raise SystemExit(1)
